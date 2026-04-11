@@ -1,6 +1,6 @@
 # MacStereoFix
 
-A tiny Mac utility that **forces every app's audio through a stereo downmix**, with a **dialogue boost** so center-channel voices stop getting lost. Built specifically to fix the "voices are super faint in this game" problem in CrossOver bottles, but it works for *any* macOS audio source — games, players, browsers — because it sits at the system audio layer.
+A small Mac utility that **forces every app's audio through a stereo downmix**, with a **dialogue boost** so center-channel voices stop getting lost. Built specifically to fix the "voices are super faint in this game" problem in CrossOver bottles, but it works for *any* macOS audio source — games, players, browsers — because it sits at the system audio layer.
 
 It works by installing a small CoreAudio virtual device called **MacStereoFix**, then routing all audio through that device, downmixing 7.1 / 5.1 to 2 channels in real time, and sending the result to the speaker / headphones / AirPods you pick.
 
@@ -135,15 +135,14 @@ Then launch the app from `/Applications`.
 1. Click the menu bar icon.
 2. Pick your real output device under **Send stereo to** (your speakers, AirPods, etc.).
 3. Flip **Force Stereo** to **ON**.
-4. Adjust **Dialogue boost** until voices sound right. Start at +3 dB and only raise it if you still can't hear dialogue. Going too high will distort loud effects.
-5. Play your game / movie / whatever. All audio now flows: app → MacStereoFix → MacStereoFix.app → real output, downmixed to stereo with your boost.
-6. Flip **OFF** when you're done. The app restores your previous default output device.
+4. Play your game / movie / whatever. All audio now flows: app → MacStereoFix → MacStereoFix.app → real output, downmixed to stereo.
+5. Flip **OFF** when you're done. The app restores your previous default output device.
 
 The first time you toggle ON, macOS will show a **microphone access** prompt. This is because the helper app is technically reading from MacStereoFix's input stream, which macOS classifies as audio input. Allow it. (No actual microphone is involved.)
 
 ### CrossOver-specific notes
 
-CrossOver / Wine bottles use the macOS system default output device for their audio. So with MacStereoFix ON, anything playing inside a bottle automatically goes through the downmix — you don't need to touch the bottle's registry, install LAV, or change anything inside the Windows app. Just pick the bottle, launch the game.
+No need to edit the registry of a bottle in CrossOver or install complicated audio applications. With MacStereoFix ON, anything playing inside a bottle automatically goes through the downmix.
 
 ---
 
@@ -174,18 +173,6 @@ rm -rf /Applications/MacStereoFix.app
 - Check that your **Send stereo to** picker isn't pointing at MacStereoFix itself (it's filtered out, but if your selection is stale it could happen — use **Refresh Devices** in Advanced).
 - Open System Settings → Sound and confirm the system output is `MacStereoFix` while the toggle is on.
 - If macOS is asking for microphone permission, grant it — without that, the capture side is silent.
-
-**Voices are still faint.**
-- Push **Dialogue boost** higher. The default is conservative.
-- If your game is outputting *stereo* (not 5.1/7.1), there's no separate center channel to boost, and you should investigate the game's own audio settings instead.
-
-**Static / clicks / glitches.**
-- This usually means the producer (game) and consumer (MacStereoFix.app) are drifting out of sync, or the helper app is being starved of CPU. Quit unrelated heavy apps and try again.
-- If it persists, raise the ring buffer size in `Driver/MacStereoFixDriver.c` (`kRingBufferFrameCount`) and `App/AudioRouter.swift` (`kMSFRingFrames`) to a larger power of two (e.g. 32768) and rebuild + reinstall.
-
-**App crashed and now I have no sound at all.**
-- Launch MacStereoFix.app — on startup it detects this case (MacStereoFix stuck as default with nobody reading from it) and switches you back to a real device automatically.
-- Or open System Settings → Sound and pick a real output device manually.
 
 **I want to remove everything.**
 ```sh

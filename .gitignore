@@ -9,5 +9,5 @@ build/
 *.xcworkspace
 xcuserdata/
 
-# Claude Code
+# Editor / tool config
 .claude/

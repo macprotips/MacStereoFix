@@ -61,7 +61,7 @@ clang \
 
 # Sign the driver bundle. Drivers loaded by coreaudiod must be signed.
 codesign --force --sign "$SIGN_IDENTITY" \
-    --timestamp=none \
+    --timestamp \
     --options runtime \
     "$DRIVER_BUNDLE"
 
@@ -119,7 +119,7 @@ rm -f "${PARTIAL_BINARIES[@]}"
 # Without com.apple.security.device.audio-input, TCC silently denies the prompt
 # and AudioUnitRender returns silence.
 codesign --force --sign "$SIGN_IDENTITY" \
-    --timestamp=none \
+    --timestamp \
     --options runtime \
     --entitlements "$APP_SRC_DIR/MacStereoFix.entitlements" \
     --deep \
