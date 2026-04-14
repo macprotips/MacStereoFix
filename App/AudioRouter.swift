@@ -22,7 +22,18 @@ let kMSFChannelCount: Int = 8
 /// Sample rate of the virtual device. Must match the driver's kSampleRate.
 let kMSFSampleRate: Float64 = 48000
 /// Frames of ring-buffer headroom between capture and render threads.
-let kMSFRingFrames: Int = 16384
+/// Matches the driver's kRingBufferFrameCount — enough slack for any IO
+/// cycle size we'd ever pick, small enough to cap worst-case latency.
+let kMSFRingFrames: Int = 4096
+/// Target IO buffer size (frames) requested on both capture and render
+/// devices. At 48 kHz this is ~2.7 ms per cycle. Clamped to each device's
+/// BufferFrameSizeRange at start; devices that can't go this small (e.g.
+/// Bluetooth) will simply use their smallest supported size.
+let kMSFTargetBufferFrames: UInt32 = 128
+/// Render-side ring-buffer fill cap. When fill exceeds this, the render
+/// callback drops the oldest frames before reading. Keeps app-side latency
+/// bounded at roughly one target IO cycle.
+let kMSFMaxFillFrames: Int = 256
 
 // MARK: - AudioRouter
 
@@ -194,6 +205,36 @@ final class AudioRouter: @unchecked Sendable {
         }
     }
 
+    // MARK: - Device buffer size helper
+
+    /// Ask a device to run with the smallest IO cycle that its range permits,
+    /// capped at `target`. Non-fatal on failure: the device keeps its current
+    /// size and we'll just get whatever latency it gives us. Must be called
+    /// before AudioUnitInitialize.
+    private func requestSmallBufferSize(deviceID: AudioDeviceID, target: UInt32) {
+        var rangeAddr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyBufferFrameSizeRange,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        var range = AudioValueRange(mMinimum: 0, mMaximum: 0)
+        var rangeSize = UInt32(MemoryLayout<AudioValueRange>.size)
+        var desired = target
+        if AudioObjectGetPropertyData(deviceID, &rangeAddr, 0, nil, &rangeSize, &range) == noErr,
+           range.mMaximum > 0 {
+            let lo = UInt32(max(1.0, range.mMinimum))
+            let hi = UInt32(range.mMaximum)
+            if desired < lo { desired = lo }
+            if desired > hi { desired = hi }
+        }
+        var value = desired
+        var sizeAddr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyBufferFrameSize,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        _ = AudioObjectSetPropertyData(deviceID, &sizeAddr, 0, nil,
+                                       UInt32(MemoryLayout<UInt32>.size), &value)
+    }
+
     // MARK: - Capture unit
 
     private func buildCaptureUnit(deviceID: AudioDeviceID) throws {
@@ -301,6 +342,11 @@ final class AudioRouter: @unchecked Sendable {
         captureBufferStorage = storage
         captureBufferCapacity = maxFrames
 
+        // Ask the virtual device for the smallest IO cycle we can get.
+        // Must happen before AudioUnitInitialize so the unit picks up the
+        // new cycle size.
+        requestSmallBufferSize(deviceID: deviceID, target: kMSFTargetBufferFrames)
+
         status = AudioUnitInitialize(u)
         if status != noErr {
             AudioComponentInstanceDispose(u)
@@ -388,6 +434,10 @@ final class AudioRouter: @unchecked Sendable {
         pullScratch = UnsafeMutablePointer<Float>.allocate(capacity: total)
         pullScratchCapacity = maxFrames
 
+        // Request the smallest IO cycle the real device supports so render
+        // latency stays low. Must happen before AudioUnitInitialize.
+        requestSmallBufferSize(deviceID: deviceID, target: kMSFTargetBufferFrames)
+
         status = AudioUnitInitialize(u)
         if status != noErr {
             AudioComponentInstanceDispose(u)
@@ -437,6 +487,16 @@ final class AudioRouter: @unchecked Sendable {
             // No scratch -> output silence.
             memset(dst, 0, frames * 2 * MemoryLayout<Float>.size)
             return noErr
+        }
+        // Cap app-side latency: if the capture side has gotten ahead of us
+        // by more than kMSFMaxFillFrames + this cycle's frames, discard the
+        // excess oldest frames before reading. Without this the steady-state
+        // fill is whatever the startup race between capture and render
+        // produced, which just sits in the pipe forever as pure delay.
+        let targetFill = kMSFMaxFillFrames + frames
+        let currentFill = router.ringBuffer.fillFrames()
+        if currentFill > targetFill {
+            router.ringBuffer.skip(frameCount: currentFill - targetFill)
         }
         let read = router.ringBuffer.read(scratch, frameCount: frames)
         if read < frames {

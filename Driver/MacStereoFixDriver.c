@@ -13,6 +13,7 @@
 // Modeled on Apple's NullAudio sample (Apple Sample Code License).
 
 #include <CoreAudio/AudioServerPlugIn.h>
+#include <CoreAudio/AudioHardware.h>
 #include <mach/mach_time.h>
 #include <math.h>
 #include <pthread.h>
@@ -32,8 +33,15 @@
 #define kChannelCount               8
 #define kSampleRate                 48000.0
 #define kBytesPerFrame              (kChannelCount * (UInt32)sizeof(Float32))
-#define kRingBufferFrameCount       16384u
+#define kRingBufferFrameCount       4096u
 #define kRingBufferSampleCount      (kRingBufferFrameCount * kChannelCount)
+
+// Client-requested IO cycle size. Clamped to [kBufferFrameSize_Min, Max] and
+// must stay below the ring so writer/reader sample-time offsets never wrap
+// past each other within a single IO cycle.
+#define kBufferFrameSize_Min        32u
+#define kBufferFrameSize_Max        2048u
+#define kBufferFrameSize_Default    512u
 
 enum {
     kObjectID_PlugIn                = kAudioObjectPlugInObject,
@@ -58,6 +66,7 @@ static Float64          gDevice_HostTicksPerFrame = 0.0;
 static UInt64           gDevice_NumberTimeStamps = 0;
 static Float64          gDevice_AnchorSampleTime = 0.0;
 static UInt64           gDevice_AnchorHostTime = 0;
+static UInt32           gDevice_BufferFrameSize = kBufferFrameSize_Default;
 
 static bool             gStream_Input_IsActive = true;
 static bool             gStream_Output_IsActive = true;
@@ -345,6 +354,8 @@ static Boolean MacStereoFix_HasProperty(AudioServerPlugInDriverRef inDriver, Aud
                 case kAudioDevicePropertyDeviceCanBeDefaultSystemDevice:
                 case kAudioDevicePropertyLatency:
                 case kAudioDevicePropertySafetyOffset:
+                case kAudioDevicePropertyBufferFrameSize:
+                case kAudioDevicePropertyBufferFrameSizeRange:
                 case kAudioDevicePropertyPreferredChannelsForStereo:
                 case kAudioDevicePropertyPreferredChannelLayout:
                     return true;
@@ -403,6 +414,11 @@ static OSStatus MacStereoFix_IsPropertySettable(AudioServerPlugInDriverRef inDri
             if (inAddress->mSelector == kAudioObjectPropertyName ||
                 inAddress->mSelector == kAudioObjectPropertyIdentify ||
                 inAddress->mSelector == kAudioBoxPropertyAcquired) {
+                *outIsSettable = true;
+            }
+            break;
+        case kObjectID_Device:
+            if (inAddress->mSelector == kAudioDevicePropertyBufferFrameSize) {
                 *outIsSettable = true;
             }
             break;
@@ -514,6 +530,8 @@ static OSStatus MacStereoFix_GetPropertyDataSize(AudioServerPlugInDriverRef inDr
                     }
                     break;
                 case kAudioDevicePropertySafetyOffset:              *outDataSize = sizeof(UInt32); break;
+                case kAudioDevicePropertyBufferFrameSize:           *outDataSize = sizeof(UInt32); break;
+                case kAudioDevicePropertyBufferFrameSizeRange:      *outDataSize = sizeof(AudioValueRange); break;
                 case kAudioDevicePropertyNominalSampleRate:         *outDataSize = sizeof(Float64); break;
                 case kAudioDevicePropertyAvailableNominalSampleRates: *outDataSize = sizeof(AudioValueRange); break;
                 case kAudioDevicePropertyIsHidden:                  *outDataSize = sizeof(UInt32); break;
@@ -854,6 +872,20 @@ static OSStatus MacStereoFix_GetPropertyData(AudioServerPlugInDriverRef inDriver
                 *((UInt32*)outData) = 0;
                 written = sizeof(UInt32);
                 break;
+            case kAudioDevicePropertyBufferFrameSize: {
+                pthread_mutex_lock(&gPlugIn_StateMutex);
+                *((UInt32*)outData) = gDevice_BufferFrameSize;
+                pthread_mutex_unlock(&gPlugIn_StateMutex);
+                written = sizeof(UInt32);
+                break;
+            }
+            case kAudioDevicePropertyBufferFrameSizeRange: {
+                if (inDataSize < sizeof(AudioValueRange)) return kAudioHardwareBadPropertySizeError;
+                ((AudioValueRange*)outData)->mMinimum = (Float64)kBufferFrameSize_Min;
+                ((AudioValueRange*)outData)->mMaximum = (Float64)kBufferFrameSize_Max;
+                written = sizeof(AudioValueRange);
+                break;
+            }
             case kAudioDevicePropertyNominalSampleRate:
                 *((Float64*)outData) = kSampleRate;
                 written = sizeof(Float64);
@@ -1119,6 +1151,33 @@ static OSStatus MacStereoFix_SetPropertyData(AudioServerPlugInDriverRef inDriver
                     pthread_mutex_lock(&gPlugIn_StateMutex);
                     gBox_Acquired = (*(UInt32*)inData != 0);
                     pthread_mutex_unlock(&gPlugIn_StateMutex);
+                    return kAudioHardwareNoError;
+                }
+            }
+            break;
+
+        case kObjectID_Device:
+            switch (inAddress->mSelector) {
+                case kAudioDevicePropertyBufferFrameSize: {
+                    if (inDataSize != sizeof(UInt32)) return kAudioHardwareBadPropertySizeError;
+                    UInt32 requested = *((const UInt32*)inData);
+                    if (requested < kBufferFrameSize_Min) requested = kBufferFrameSize_Min;
+                    if (requested > kBufferFrameSize_Max) requested = kBufferFrameSize_Max;
+                    bool changed = false;
+                    pthread_mutex_lock(&gPlugIn_StateMutex);
+                    if (gDevice_BufferFrameSize != requested) {
+                        gDevice_BufferFrameSize = requested;
+                        changed = true;
+                    }
+                    pthread_mutex_unlock(&gPlugIn_StateMutex);
+                    if (changed && gPlugIn_Host != NULL) {
+                        AudioObjectPropertyAddress changedAddr = {
+                            kAudioDevicePropertyBufferFrameSize,
+                            kAudioObjectPropertyScopeGlobal,
+                            kAudioObjectPropertyElementMain
+                        };
+                        gPlugIn_Host->PropertiesChanged(gPlugIn_Host, kObjectID_Device, 1, &changedAddr);
+                    }
                     return kAudioHardwareNoError;
                 }
             }

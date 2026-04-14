@@ -56,6 +56,29 @@ final class RingBuffer {
         msf_atomic_store(readPtr, 0)
     }
 
+    /// Current number of frames available to read. Safe to call from the
+    /// consumer side.
+    func fillFrames() -> Int {
+        let w = msf_atomic_load(writePtr)
+        let r = msf_atomic_load(readPtr)
+        return Int(w &- r)
+    }
+
+    /// Advance the read pointer by up to `frameCount` frames without reading
+    /// them. Used by the consumer to drop oldest frames when the buffer has
+    /// accumulated more latency than desired. Returns the number actually
+    /// skipped.
+    @discardableResult
+    func skip(frameCount: Int) -> Int {
+        let w = msf_atomic_load(writePtr)
+        let r = msf_atomic_load(readPtr)
+        let avail = Int(w &- r)
+        if avail <= 0 || frameCount <= 0 { return 0 }
+        let toSkip = min(frameCount, avail)
+        msf_atomic_store(readPtr, r &+ UInt64(toSkip))
+        return toSkip
+    }
+
     /// Write up to `frameCount` frames from `src`. Returns frames written.
     /// Caller is the single producer.
     @discardableResult
