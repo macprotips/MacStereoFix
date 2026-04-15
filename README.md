@@ -8,6 +8,15 @@ This is a personal-use project for a small group of friends. It is not a polishe
 
 ---
 
+## Download
+
+Prebuilt signed + notarized app:
+**[MacStereoFix v1.2](https://github.com/macprotips/MacStereoFix/releases/latest)**
+
+Unzip, drag `MacStereoFix.app` into `/Applications`, launch it, and click **Install Driver** in the menu bar popover. That's it.
+
+---
+
 ## What's in here
 
 ```
