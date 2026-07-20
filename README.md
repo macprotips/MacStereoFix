@@ -89,27 +89,6 @@ build/MacStereoFix.app          # the menu bar app, with the driver bundled insi
 
 Both bundles are universal (arm64 + x86_64) and ad-hoc signed.
 
-### Building a signed copy for friends
-
-If you want to distribute to friends without Gatekeeper warnings, set your Developer ID identity before building:
-
-```sh
-SIGN_IDENTITY="Developer ID Application: Your Name (TEAMID1234)" ./build.sh
-```
-
-Then notarize the app (and ideally a `.pkg` you build separately) so friends can install without right-click → Open dance:
-
-```sh
-xcrun notarytool submit build/MacStereoFix.app \
-    --apple-id you@example.com \
-    --team-id TEAMID1234 \
-    --password "@keychain:notarytool" \
-    --wait
-xcrun stapler staple build/MacStereoFix.app
-```
-
-(See Apple's notarization docs for the keychain setup.)
-
 ---
 
 ## Installing
