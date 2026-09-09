@@ -31,7 +31,6 @@ Apple's audio converter handles output sample-rate conversion and small clock
 differences. Virtual and aggregate destinations are excluded to avoid feedback.
 Bluetooth call modes with only one output channel are not supported.
 
-- **Dialogue boost:** 0–9 dB above the base center coefficient; default +3 dB.
 - **Volume and mute:** attenuate routed audio without changing hardware volume
   or left/right balance. Turning Off returns to the device's normal volume.
 - **Off and Quit:** attempt to restore the previous output, with a connected
@@ -39,6 +38,8 @@ Bluetooth call modes with only one output channel are not supported.
   if the app crashes or is force-quit. It exits afterward and has no login item.
 - **Sleep, device loss, routing errors, and manual output changes:** stop routing.
   The app starts off at each launch and does not automatically resume capture.
+- **Optional dialogue boost:** under **Advanced**, 0–9 dB above the base center
+  coefficient. Off (0 dB) by default; an explicitly saved setting is retained.
 
 The mix is `L + Cgain*C + 0.707*Ls + 0.5*Lsr` and the corresponding right channels.
 `Cgain = 0.707 * 10^(boost/20)`. LFE is omitted. Invalid samples are silenced and
@@ -79,7 +80,7 @@ only after the intended output is available.
 
 ## Remove it
 
-Use **Driver & help → Uninstall…**, then move the app from Applications to the
+Use **Advanced → Uninstall…**, then move the app from Applications to the
 Trash. The app stops routing first. Removal needs administrator authorization
 and briefly interrupts Mac audio.
 

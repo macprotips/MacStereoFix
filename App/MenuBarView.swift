@@ -36,8 +36,6 @@ struct MenuBarView: View {
                         outputSection
                         Divider()
                         volumeSection
-                        Divider()
-                        dialogueSection
                     }
                     .padding(14)
                     .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 12))
@@ -45,7 +43,7 @@ struct MenuBarView: View {
                     setupSection
                 }
                 messages
-                driverSection
+                advancedSection
                 Divider()
                 footer
             }
@@ -163,14 +161,14 @@ struct MenuBarView: View {
             HStack {
                 Text("Dialogue boost").font(.subheadline.weight(.medium))
                 Spacer()
-                Text("+\(Int(state.dialogueBoostDB)) dB")
+                Text(state.dialogueBoostDB == 0 ? "Off" : "+\(Int(state.dialogueBoostDB)) dB")
                     .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
             }
             Slider(value: $state.dialogueBoostDB, in: 0...9, step: 1) { Text("Dialogue boost") }
                 .labelsHidden()
-                .accessibilityValue("\(Int(state.dialogueBoostDB)) decibels")
+                .accessibilityValue(state.dialogueBoostDB == 0 ? "Off" : "\(Int(state.dialogueBoostDB)) decibels")
                 .disabled(state.isBusy)
-            Text("Raises the center channel in surround audio. Start at a low volume; high boost can distort loud scenes.")
+            Text("Optional center-channel boost. Off keeps the standard stereo mix. High boost can distort loud scenes.")
                 .font(.caption2).foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
         }
@@ -236,9 +234,13 @@ struct MenuBarView: View {
         }
     }
 
-    private var driverSection: some View {
-        DisclosureGroup("Driver & help") {
+    private var advancedSection: some View {
+        DisclosureGroup("Advanced") {
             VStack(alignment: .leading, spacing: 10) {
+                if state.driverInstalled {
+                    dialogueSection
+                    Divider()
+                }
                 Label(state.driverInstalled ? "Audio driver ready" : "Current audio driver needed",
                       systemImage: state.driverInstalled ? "checkmark.circle" : "info.circle")
                 HStack {

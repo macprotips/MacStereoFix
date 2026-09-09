@@ -15,7 +15,7 @@ final class AppState: ObservableObject {
     @Published var selectedOutputUID: String? {
         didSet { defaults.set(selectedOutputUID, forKey: "selectedOutputUID") }
     }
-    @Published var dialogueBoostDB: Float = 3 {
+    @Published var dialogueBoostDB: Float = 0 {
         didSet {
             router.setDialogueBoostDB(dialogueBoostDB)
             defaults.set(dialogueBoostDB, forKey: "dialogueBoostDB")

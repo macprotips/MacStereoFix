@@ -102,6 +102,10 @@ struct StateTests {
             let state = AppState(defaults: defaults, requestPermission: { true })
             assert(state.selectedOutputUID == "headphones")
             assert(defaults.string(forKey: "selectedOutputUID") == "headphones")
+            assert(state.dialogueBoostDB == 0, "Dialogue boost must be opt-in")
+            state.dialogueBoostDB = 6
+            let restored = AppState(defaults: defaults, requestPermission: { true })
+            assert(restored.dialogueBoostDB == 6, "Keep an explicitly saved boost")
         }
         reset()
         do {
