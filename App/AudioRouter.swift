@@ -21,19 +21,11 @@ import AudioToolbox
 let kMSFChannelCount: Int = 8
 /// Sample rate of the virtual device. Must match the driver's kSampleRate.
 let kMSFSampleRate: Float64 = 48000
-/// Frames of ring-buffer headroom between capture and render threads.
-/// Matches the driver's kRingBufferFrameCount — enough slack for any IO
-/// cycle size we'd ever pick, small enough to cap worst-case latency.
-let kMSFRingFrames: Int = 4096
-/// Target IO buffer size (frames) requested on both capture and render
-/// devices. At 48 kHz this is ~2.7 ms per cycle. Clamped to each device's
-/// BufferFrameSizeRange at start; devices that can't go this small (e.g.
-/// Bluetooth) will simply use their smallest supported size.
-let kMSFTargetBufferFrames: UInt32 = 128
-/// Render-side ring-buffer fill cap. When fill exceeds this, the render
-/// callback drops the oldest frames before reading. Keeps app-side latency
-/// bounded at roughly one target IO cycle.
-let kMSFMaxFillFrames: Int = 256
+/// Bounded storage for large hardware IO cycles and sample-rate conversion.
+let kMSFRingFrames = 32768
+let kMSFMaximumFrames: UInt32 = 8192
+let kMSFMaximumSourceFrames = 16384
+let kMSFMaxFillFrames = 4096
 
 // MARK: - AudioRouter
 
@@ -62,6 +54,7 @@ final class AudioRouter: @unchecked Sendable {
 
     private var captureUnit: AudioUnit?
     private var renderUnit: AudioUnit?
+    private var converterUnit: AudioUnit?
 
     // MARK: Buffers
 
@@ -77,25 +70,42 @@ final class AudioRouter: @unchecked Sendable {
     /// Scratch used inside the render callback to pull 8-ch frames from the
     /// ring buffer before downmixing. Lives as long as the render unit.
     private var pullScratch: UnsafeMutablePointer<Float>?
+    private var stereoScratch: UnsafeMutablePointer<Float>?
     private var pullScratchCapacity: Int = 0
+    private var renderPrimed = false // consumer only; reset with IO stopped
 
     // MARK: Downmix gains
 
     /// Linear center-channel gain. Read on the real-time render thread, written
     /// from the UI thread — stored as an atomic float so there's no tearing.
     private let centerGain = UnsafeMutablePointer<MSFAtomicFloat>.allocate(capacity: 1)
-    /// Surround / rear-surround coefficients are fixed ITU constants.
-    private static let surroundGain: Float = 0.707  // -3 dB, ITU Ls/Rs
-    private static let rearGain: Float = 0.5        // -6 dB, Lsr/Rsr
+    /// Software attenuation applied after the bounded stereo downmix.
+    private let outputGain = UnsafeMutablePointer<MSFAtomicFloat>.allocate(capacity: 1)
+    private let callbackFailure = UnsafeMutablePointer<MSFAtomicU64>.allocate(capacity: 1)
+    private let captureCycles = UnsafeMutablePointer<MSFAtomicU64>.allocate(capacity: 1)
+    private let renderCycles = UnsafeMutablePointer<MSFAtomicU64>.allocate(capacity: 1)
+    private let bufferedFrames = UnsafeMutablePointer<MSFAtomicFloat>.allocate(capacity: 1)
+    private(set) var outputSampleRate: Float64 = 0
 
     // MARK: - Init / deinit
 
     init() {
         msf_atomic_float_init(centerGain, 0.707)
+        msf_atomic_float_init(outputGain, 1)
+        msf_atomic_init(callbackFailure, 0)
+        msf_atomic_init(captureCycles, 0)
+        msf_atomic_init(renderCycles, 0)
+        msf_atomic_float_init(bufferedFrames, Float(StereoMix.reserveFrames))
     }
 
     deinit {
+        stop()
         centerGain.deallocate()
+        outputGain.deallocate()
+        callbackFailure.deallocate()
+        captureCycles.deallocate()
+        renderCycles.deallocate()
+        bufferedFrames.deallocate()
     }
 
     // MARK: - Public API
@@ -105,7 +115,7 @@ final class AudioRouter: @unchecked Sendable {
 
     /// Set the dialogue boost in dB (added on top of the -3 dB ITU baseline).
     func setDialogueBoostDB(_ dB: Float) {
-        let linear: Float = 0.707 * pow(10.0, dB / 20.0)
+        let linear = StereoMix.centerGain(boostDB: dB)
         msf_atomic_float_store(centerGain, linear)
     }
 
@@ -119,12 +129,16 @@ final class AudioRouter: @unchecked Sendable {
         }
 
         ringBuffer.reset()
-
-        try buildCaptureUnit(deviceID: macStereoFix)
+        renderPrimed = false
+        msf_atomic_float_store(bufferedFrames, Float(StereoMix.reserveFrames))
+        msf_atomic_store(callbackFailure, 0)
+        msf_atomic_store(captureCycles, 0)
+        msf_atomic_store(renderCycles, 0)
         do {
+            try buildCaptureUnit(deviceID: macStereoFix)
             try buildRenderUnit(deviceID: outputDevice)
         } catch {
-            tearDownCaptureUnit()
+            tearDown()
             throw error
         }
 
@@ -146,26 +160,30 @@ final class AudioRouter: @unchecked Sendable {
     }
 
     func stop() {
-        if let c = captureUnit { AudioOutputUnitStop(c) }
-        if let r = renderUnit  { AudioOutputUnitStop(r) }
         tearDown()
     }
 
-    /// Swap only the render (output) device while capture stays running.
-    /// This avoids toggling the system default device and eliminates the
-    /// audible gap when the user switches output devices mid-session.
+    /// Rebuild with both callbacks stopped before touching shared storage.
     func switchOutputDevice(_ newDeviceID: AudioDeviceID) throws {
-        guard isRunning else { return }
-        if let r = renderUnit { AudioOutputUnitStop(r) }
-        tearDownRenderUnit()
-        try buildRenderUnit(deviceID: newDeviceID)
-        if let r = renderUnit {
-            let status = AudioOutputUnitStart(r)
-            if status != noErr {
-                tearDownRenderUnit()
-                throw RouterError.audioUnitError("AudioOutputUnitStart(render switch)", status)
-            }
+        stop()
+        try start(outputDevice: newDeviceID)
+    }
+
+    func setOutputVolume(_ volume: Float) {
+        msf_atomic_float_store(outputGain, volume.isFinite ? min(max(volume, 0), 1) : 0)
+    }
+
+    var audioFailed: Bool { msf_atomic_load(callbackFailure) != 0 }
+    func updateClockDrift() {
+        guard let converterUnit else { return }
+        let rate = StereoMix.clockRate(bufferedFrames: msf_atomic_float_load(bufferedFrames))
+        if AudioUnitSetParameter(converterUnit, kVarispeedParam_PlaybackRate,
+            kAudioUnitScope_Global, 0, rate, 0) != noErr {
+            msf_atomic_store(callbackFailure, 1)
         }
+    }
+    var progress: (capture: UInt64, render: UInt64) {
+        (msf_atomic_load(captureCycles), msf_atomic_load(renderCycles))
     }
 
     // MARK: - Teardown
@@ -177,6 +195,7 @@ final class AudioRouter: @unchecked Sendable {
 
     private func tearDownCaptureUnit() {
         if let c = captureUnit {
+            AudioOutputUnitStop(c)
             AudioUnitUninitialize(c)
             AudioComponentInstanceDispose(c)
             captureUnit = nil
@@ -194,45 +213,23 @@ final class AudioRouter: @unchecked Sendable {
 
     private func tearDownRenderUnit() {
         if let r = renderUnit {
+            AudioOutputUnitStop(r)
             AudioUnitUninitialize(r)
             AudioComponentInstanceDispose(r)
             renderUnit = nil
+        }
+        if let c = converterUnit {
+            AudioUnitUninitialize(c)
+            AudioComponentInstanceDispose(c)
+            converterUnit = nil
         }
         if let p = pullScratch {
             p.deallocate()
             pullScratch = nil
             pullScratchCapacity = 0
         }
-    }
-
-    // MARK: - Device buffer size helper
-
-    /// Ask a device to run with the smallest IO cycle that its range permits,
-    /// capped at `target`. Non-fatal on failure: the device keeps its current
-    /// size and we'll just get whatever latency it gives us. Must be called
-    /// before AudioUnitInitialize.
-    private func requestSmallBufferSize(deviceID: AudioDeviceID, target: UInt32) {
-        var rangeAddr = AudioObjectPropertyAddress(
-            mSelector: kAudioDevicePropertyBufferFrameSizeRange,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain)
-        var range = AudioValueRange(mMinimum: 0, mMaximum: 0)
-        var rangeSize = UInt32(MemoryLayout<AudioValueRange>.size)
-        var desired = target
-        if AudioObjectGetPropertyData(deviceID, &rangeAddr, 0, nil, &rangeSize, &range) == noErr,
-           range.mMaximum > 0 {
-            let lo = UInt32(max(1.0, range.mMinimum))
-            let hi = UInt32(range.mMaximum)
-            if desired < lo { desired = lo }
-            if desired > hi { desired = hi }
-        }
-        var value = desired
-        var sizeAddr = AudioObjectPropertyAddress(
-            mSelector: kAudioDevicePropertyBufferFrameSize,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain)
-        _ = AudioObjectSetPropertyData(deviceID, &sizeAddr, 0, nil,
-                                       UInt32(MemoryLayout<UInt32>.size), &value)
+        stereoScratch?.deallocate()
+        stereoScratch = nil
     }
 
     // MARK: - Capture unit
@@ -318,19 +315,14 @@ final class AudioRouter: @unchecked Sendable {
             throw RouterError.audioUnitError("SetInputCallback", status)
         }
 
-        // Query the device's maximum IO buffer size so we never under-allocate.
-        // Fall back to a safe default if the query fails.
-        var maxFrameSize: UInt32 = 0
-        var propSize = UInt32(MemoryLayout<UInt32>.size)
-        var bufSizeAddr = AudioObjectPropertyAddress(
-            mSelector: kAudioDevicePropertyBufferFrameSize,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain)
-        if AudioObjectGetPropertyData(deviceID, &bufSizeAddr, 0, nil, &propSize, &maxFrameSize) != noErr || maxFrameSize == 0 {
-            maxFrameSize = 4096
+        var maximum = kMSFMaximumFrames
+        status = AudioUnitSetProperty(u, kAudioUnitProperty_MaximumFramesPerSlice,
+            kAudioUnitScope_Global, 0, &maximum, UInt32(MemoryLayout<UInt32>.size))
+        if status != noErr {
+            AudioComponentInstanceDispose(u)
+            throw RouterError.audioUnitError("MaximumFrames(capture)", status)
         }
-        // Add headroom: some devices may deliver slightly more than reported.
-        let maxFrames = Int(maxFrameSize) * 2
+        let maxFrames = Int(maximum)
         let totalSamples = maxFrames * kMSFChannelCount
         let storage = UnsafeMutablePointer<Float>.allocate(capacity: totalSamples)
         let abl = UnsafeMutablePointer<AudioBufferList>.allocate(capacity: 1)
@@ -341,11 +333,6 @@ final class AudioRouter: @unchecked Sendable {
         captureBufferList = abl
         captureBufferStorage = storage
         captureBufferCapacity = maxFrames
-
-        // Ask the virtual device for the smallest IO cycle we can get.
-        // Must happen before AudioUnitInitialize so the unit picks up the
-        // new cycle size.
-        requestSmallBufferSize(deviceID: deviceID, target: kMSFTargetBufferFrames)
 
         status = AudioUnitInitialize(u)
         if status != noErr {
@@ -385,15 +372,26 @@ final class AudioRouter: @unchecked Sendable {
             throw RouterError.audioUnitError("CurrentDevice(render)", status)
         }
 
-        // We provide stereo Float32 at 48k. The HALOutput unit will sample-rate
-        // convert to whatever the device wants.
+        // AUHAL requires the hardware's sample rate. A separate Apple converter
+        // supplies stereo at that rate without changing the user's device format.
+        var hardwareFormat = AudioStreamBasicDescription()
+        var formatSize = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+        status = AudioUnitGetProperty(u, kAudioUnitProperty_StreamFormat,
+            kAudioUnitScope_Output, 0, &hardwareFormat, &formatSize)
+        guard status == noErr, hardwareFormat.mSampleRate.isFinite,
+              (32000...192000).contains(hardwareFormat.mSampleRate),
+              hardwareFormat.mChannelsPerFrame >= 2 else {
+            AudioComponentInstanceDispose(u)
+            throw RouterError.audioUnitError("Select a stereo output at 32–192 kHz", status == noErr ? kAudioDeviceUnsupportedFormatError : status)
+        }
+        outputSampleRate = hardwareFormat.mSampleRate
         var fmt = AudioStreamBasicDescription(
-            mSampleRate: kMSFSampleRate,
+            mSampleRate: outputSampleRate,
             mFormatID: kAudioFormatLinearPCM,
-            mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagsNativeEndian | kAudioFormatFlagIsPacked,
-            mBytesPerPacket: UInt32(2 * MemoryLayout<Float>.size),
+            mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagsNativeEndian | kAudioFormatFlagIsPacked | kAudioFormatFlagIsNonInterleaved,
+            mBytesPerPacket: UInt32(MemoryLayout<Float>.size),
             mFramesPerPacket: 1,
-            mBytesPerFrame: UInt32(2 * MemoryLayout<Float>.size),
+            mBytesPerFrame: UInt32(MemoryLayout<Float>.size),
             mChannelsPerFrame: 2,
             mBitsPerChannel: 32,
             mReserved: 0)
@@ -406,45 +404,72 @@ final class AudioRouter: @unchecked Sendable {
             throw RouterError.audioUnitError("StreamFormat(render in)", status)
         }
 
-        var cb = AURenderCallbackStruct(
-            inputProc: AudioRouter.renderCallback,
-            inputProcRefCon: Unmanaged.passUnretained(self).toOpaque())
-        status = AudioUnitSetProperty(u,
-            kAudioUnitProperty_SetRenderCallback,
-            kAudioUnitScope_Input, 0,
-            &cb, UInt32(MemoryLayout<AURenderCallbackStruct>.size))
-        if status != noErr {
+        do {
+            let converter = try buildConverter(outputFormat: fmt)
+            var connection = AudioUnitConnection(sourceAudioUnit: converter, sourceOutputNumber: 0, destInputNumber: 0)
+            var maximum = kMSFMaximumFrames
+            try check("Output frame limit", AudioUnitSetProperty(u, kAudioUnitProperty_MaximumFramesPerSlice,
+                kAudioUnitScope_Global, 0, &maximum, UInt32(MemoryLayout<UInt32>.size)))
+            try check("Connect converter", AudioUnitSetProperty(u, kAudioUnitProperty_MakeConnection,
+                kAudioUnitScope_Input, 0, &connection, UInt32(MemoryLayout<AudioUnitConnection>.size)))
+            try check("Initialize render", AudioUnitInitialize(u))
+        } catch {
             AudioComponentInstanceDispose(u)
-            throw RouterError.audioUnitError("SetRenderCallback", status)
-        }
-
-        // Query the output device's buffer size and add headroom for the
-        // render-side 8ch pull scratch.
-        var outBufSize: UInt32 = 0
-        var obsPropSize = UInt32(MemoryLayout<UInt32>.size)
-        var obsSizeAddr = AudioObjectPropertyAddress(
-            mSelector: kAudioDevicePropertyBufferFrameSize,
-            mScope: kAudioObjectPropertyScopeOutput,
-            mElement: kAudioObjectPropertyElementMain)
-        if AudioObjectGetPropertyData(deviceID, &obsSizeAddr, 0, nil, &obsPropSize, &outBufSize) != noErr || outBufSize == 0 {
-            outBufSize = 4096
-        }
-        let maxFrames = Int(outBufSize) * 2
-        let total = maxFrames * kMSFChannelCount
-        pullScratch = UnsafeMutablePointer<Float>.allocate(capacity: total)
-        pullScratchCapacity = maxFrames
-
-        // Request the smallest IO cycle the real device supports so render
-        // latency stays low. Must happen before AudioUnitInitialize.
-        requestSmallBufferSize(deviceID: deviceID, target: kMSFTargetBufferFrames)
-
-        status = AudioUnitInitialize(u)
-        if status != noErr {
-            AudioComponentInstanceDispose(u)
-            throw RouterError.audioUnitError("AudioUnitInitialize(render)", status)
+            throw error
         }
         renderUnit = u
     }
+
+    private func check(_ operation: String, _ status: OSStatus) throws {
+        if status != noErr { throw RouterError.audioUnitError(operation, status) }
+    }
+
+    private func buildConverter(outputFormat: AudioStreamBasicDescription) throws -> AudioUnit {
+        var description = AudioComponentDescription(componentType: kAudioUnitType_FormatConverter,
+            componentSubType: kAudioUnitSubType_Varispeed,
+            componentManufacturer: kAudioUnitManufacturer_Apple, componentFlags: 0, componentFlagsMask: 0)
+        guard let component = AudioComponentFindNext(nil, &description) else { throw RouterError.componentNotFound }
+        var unit: AudioUnit?
+        try check("Create converter", AudioComponentInstanceNew(component, &unit))
+        guard let unit else { throw RouterError.componentNotFound }
+        converterUnit = unit
+        var format = outputFormat
+        var source = format
+        source.mSampleRate = kMSFSampleRate
+        let formatSize = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+        var callback = AURenderCallbackStruct(inputProc: AudioRouter.renderCallback,
+            inputProcRefCon: Unmanaged.passUnretained(self).toOpaque())
+        var maximum = UInt32(kMSFMaximumSourceFrames)
+        try check("Converter input", AudioUnitSetProperty(unit, kAudioUnitProperty_StreamFormat,
+            kAudioUnitScope_Input, 0, &source, formatSize))
+        try check("Converter output", AudioUnitSetProperty(unit, kAudioUnitProperty_StreamFormat,
+            kAudioUnitScope_Output, 0, &format, formatSize))
+        try check("Converter callback", AudioUnitSetProperty(unit, kAudioUnitProperty_SetRenderCallback,
+            kAudioUnitScope_Input, 0, &callback, UInt32(MemoryLayout<AURenderCallbackStruct>.size)))
+        try check("Converter frame limit", AudioUnitSetProperty(unit, kAudioUnitProperty_MaximumFramesPerSlice,
+            kAudioUnitScope_Global, 0, &maximum, UInt32(MemoryLayout<UInt32>.size)))
+        pullScratch = UnsafeMutablePointer<Float>.allocate(capacity: kMSFMaximumSourceFrames * kMSFChannelCount)
+        stereoScratch = UnsafeMutablePointer<Float>.allocate(capacity: kMSFMaximumSourceFrames * 2)
+        pullScratchCapacity = kMSFMaximumSourceFrames
+        try check("Initialize converter", AudioUnitInitialize(unit))
+        return unit
+    }
+
+    #if MSF_TESTING
+    // Exercise the production converter and callback without installing a driver
+    // or sending any audio to hardware. This code is absent from app builds.
+    func prepareOfflineOutput(sampleRate: Float64) throws -> AudioUnit {
+        stop()
+        ringBuffer.reset()
+        renderPrimed = false
+        return try buildConverter(outputFormat: AudioStreamBasicDescription(mSampleRate: sampleRate,
+            mFormatID: kAudioFormatLinearPCM,
+            mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagsNativeEndian | kAudioFormatFlagIsPacked | kAudioFormatFlagIsNonInterleaved,
+            mBytesPerPacket: 4, mFramesPerPacket: 1, mBytesPerFrame: 4,
+            mChannelsPerFrame: 2, mBitsPerChannel: 32, mReserved: 0))
+    }
+    func enqueueOfflineAudio(_ source: UnsafePointer<Float>, frames: Int) { ringBuffer.write(source, frameCount: frames) }
+    #endif
 
     // MARK: - Real-time callbacks (C-style)
 
@@ -455,13 +480,24 @@ final class AudioRouter: @unchecked Sendable {
               let abl = router.captureBufferList else {
             return noErr
         }
-        // Clamp to our buffer capacity — drop excess frames rather than overrun.
-        let framesToCapture = min(Int(inNumberFrames), router.captureBufferCapacity)
+        let framesToCapture = Int(inNumberFrames)
+        guard framesToCapture <= router.captureBufferCapacity else {
+            msf_atomic_store(router.callbackFailure, 1)
+            return kAudioUnitErr_TooManyFramesToProcess
+        }
         abl.pointee.mBuffers.mDataByteSize = UInt32(framesToCapture * kMSFChannelCount * MemoryLayout<Float>.size)
         let status = AudioUnitRender(unit, ioActionFlags, inTimeStamp, inBusNumber, UInt32(framesToCapture), abl)
         if status != noErr {
+            msf_atomic_store(router.callbackFailure, 1)
             return status
         }
+        guard abl.pointee.mNumberBuffers == 1, abl.pointee.mBuffers.mNumberChannels == UInt32(kMSFChannelCount),
+              abl.pointee.mBuffers.mData != nil,
+              Int(abl.pointee.mBuffers.mDataByteSize) >= framesToCapture * kMSFChannelCount * MemoryLayout<Float>.size else {
+            msf_atomic_store(router.callbackFailure, 1)
+            return kAudioUnitErr_FormatNotSupported
+        }
+        msf_atomic_store(router.captureCycles, msf_atomic_load(router.captureCycles) &+ 1)
         // Push captured 8ch frames into the ring buffer (drop on overflow).
         if let raw = abl.pointee.mBuffers.mData {
             let src = raw.assumingMemoryBound(to: Float.self)
@@ -475,19 +511,30 @@ final class AudioRouter: @unchecked Sendable {
         let router = Unmanaged<AudioRouter>.fromOpaque(inRefCon).takeUnretainedValue()
         guard let ioData = ioData else { return noErr }
         let abl = UnsafeMutableAudioBufferListPointer(ioData)
-        // Render unit's input format is interleaved stereo Float32 -> single buffer.
-        guard abl.count >= 1 else { return noErr }
-        let stereoBuf = abl[0]
-        guard let stereoRaw = stereoBuf.mData else { return noErr }
-        let dst = stereoRaw.assumingMemoryBound(to: Float.self)
         let frames = Int(inNumberFrames)
-
-        // Pull 8ch frames from ring buffer into scratch.
-        guard let scratch = router.pullScratch, router.pullScratchCapacity >= frames else {
-            // No scratch -> output silence.
-            memset(dst, 0, frames * 2 * MemoryLayout<Float>.size)
-            return noErr
+        let bytes = frames * MemoryLayout<Float>.size
+        // AUVarispeed uses planar Float32. Provide preallocated storage whenever
+        // the converter leaves a channel pointer nil, and validate every plane.
+        guard abl.count == 2, frames <= router.pullScratchCapacity,
+              let scratch = router.pullScratch, let stereo = router.stereoScratch else {
+            for buffer in abl { if let data = buffer.mData { memset(data, 0, Int(buffer.mDataByteSize)) } }
+            msf_atomic_store(router.callbackFailure, 1)
+            return kAudioUnitErr_TooManyFramesToProcess
         }
+        for channel in 0..<2 {
+            if abl[channel].mData == nil {
+                abl[channel].mData = UnsafeMutableRawPointer(stereo.advanced(by: channel * router.pullScratchCapacity))
+                abl[channel].mDataByteSize = UInt32(bytes)
+            }
+            guard abl[channel].mNumberChannels == 1, Int(abl[channel].mDataByteSize) >= bytes else {
+                for buffer in abl { if let data = buffer.mData { memset(data, 0, Int(buffer.mDataByteSize)) } }
+                msf_atomic_store(router.callbackFailure, 1)
+                return kAudioUnitErr_FormatNotSupported
+            }
+        }
+        let left = abl[0].mData!.assumingMemoryBound(to: Float.self)
+        let right = abl[1].mData!.assumingMemoryBound(to: Float.self)
+
         // Cap app-side latency: if the capture side has gotten ahead of us
         // by more than kMSFMaxFillFrames + this cycle's frames, discard the
         // excess oldest frames before reading. Without this the steady-state
@@ -495,41 +542,33 @@ final class AudioRouter: @unchecked Sendable {
         // produced, which just sits in the pipe forever as pure delay.
         let targetFill = kMSFMaxFillFrames + frames
         let currentFill = router.ringBuffer.fillFrames()
+        if !router.renderPrimed {
+            guard currentFill >= frames + StereoMix.reserveFrames else {
+                memset(left, 0, bytes)
+                memset(right, 0, bytes)
+                return noErr
+            }
+            router.renderPrimed = true
+        }
         if currentFill > targetFill {
             router.ringBuffer.skip(frameCount: currentFill - targetFill)
         }
         let read = router.ringBuffer.read(scratch, frameCount: frames)
+        let fill = Float(router.ringBuffer.fillFrames())
+        let previous = msf_atomic_float_load(router.bufferedFrames)
+        msf_atomic_float_store(router.bufferedFrames, previous + 0.01 * (fill - previous))
         if read < frames {
+            router.renderPrimed = false
             // Zero-fill the tail of scratch where we have no data.
             let tailStart = read * kMSFChannelCount
             let tailCount = (frames - read) * kMSFChannelCount
             memset(scratch.advanced(by: tailStart), 0, tailCount * MemoryLayout<Float>.size)
         }
 
-        // Downmix 8ch interleaved -> stereo interleaved.
-        // Channel order (matches driver's preferred layout):
-        //   0: L  1: R  2: C  3: LFE  4: Ls  5: Rs  6: Lsr  7: Rsr
-        let cgain = msf_atomic_float_load(router.centerGain)
-        let sgain = AudioRouter.surroundGain
-        let rgain = AudioRouter.rearGain
-        var s = 0
-        var d = 0
-        for _ in 0..<frames {
-            let l   = scratch[s + 0]
-            let r   = scratch[s + 1]
-            let c   = scratch[s + 2]
-            // skip LFE
-            let ls  = scratch[s + 4]
-            let rs  = scratch[s + 5]
-            let lsr = scratch[s + 6]
-            let rsr = scratch[s + 7]
-            let lo = min(max(l + cgain * c + sgain * ls + rgain * lsr, -1.0), 1.0)
-            let ro = min(max(r + cgain * c + sgain * rs + rgain * rsr, -1.0), 1.0)
-            dst[d + 0] = lo
-            dst[d + 1] = ro
-            s += kMSFChannelCount
-            d += 2
-        }
+        StereoMix.process(scratch, into: left, right: right, frames: frames,
+            centerGain: msf_atomic_float_load(router.centerGain),
+            volume: msf_atomic_float_load(router.outputGain))
+        msf_atomic_store(router.renderCycles, msf_atomic_load(router.renderCycles) &+ 1)
         return noErr
     }
 }

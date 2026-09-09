@@ -10,7 +10,7 @@
 // buffer indexed by the host's sample clock. All downmixing happens in the
 // MacStereoFix.app helper.
 //
-// Modeled on Apple's NullAudio sample (Apple Sample Code License).
+// Modeled on Apple's NullAudio sample. See ThirdParty/Apple-NullAudio-LICENSE.txt.
 
 #include <CoreAudio/AudioServerPlugIn.h>
 #include <CoreAudio/AudioHardware.h>
@@ -18,6 +18,8 @@
 #include <math.h>
 #include <pthread.h>
 #include <string.h>
+#include <stdatomic.h>
+#include <limits.h>
 
 #pragma mark - Configuration
 
@@ -29,6 +31,7 @@
 #define kDevice_ModelUID            "MacStereoFixDevice_ModelUID"
 #define kDevice_Name                "MacStereoFix"
 #define kDevice_Manufacturer        "MacStereoFix"
+#define kDriverVersion              "4"
 
 #define kChannelCount               8
 #define kSampleRate                 48000.0
@@ -36,12 +39,11 @@
 #define kRingBufferFrameCount       4096u
 #define kRingBufferSampleCount      (kRingBufferFrameCount * kChannelCount)
 
-// Client-requested IO cycle size. Clamped to [kBufferFrameSize_Min, Max] and
-// must stay below the ring so writer/reader sample-time offsets never wrap
-// past each other within a single IO cycle.
-#define kBufferFrameSize_Min        32u
-#define kBufferFrameSize_Max        2048u
-#define kBufferFrameSize_Default    512u
+// Fixed device configuration. IO-affecting changes require a host-coordinated
+// configuration change; never mutate the buffer size from a property setter.
+#define kBufferFrameSize_Min        128u
+#define kBufferFrameSize_Max        128u
+#define kBufferFrameSize_Default    128u
 
 enum {
     kObjectID_PlugIn                = kAudioObjectPlugInObject,
@@ -49,7 +51,8 @@ enum {
     kObjectID_Device                = 3,
     kObjectID_Stream_Input          = 4,
     kObjectID_Stream_Output         = 5,
-    kObjectID_Volume_Output_Master  = 6
+    kObjectID_Volume_Output_Master  = 6,
+    kObjectID_Mute_Output_Master    = 7
 };
 
 #pragma mark - State
@@ -63,22 +66,41 @@ static Boolean          gBox_Acquired = true;
 
 static UInt64           gDevice_IOIsRunning = 0;
 static Float64          gDevice_HostTicksPerFrame = 0.0;
-static UInt64           gDevice_NumberTimeStamps = 0;
-static Float64          gDevice_AnchorSampleTime = 0.0;
-static UInt64           gDevice_AnchorHostTime = 0;
+static _Atomic UInt64   gDevice_AnchorHostTime = 0;
+static _Atomic UInt64   gDevice_TimeStampSeed = 0;
 static UInt32           gDevice_BufferFrameSize = kBufferFrameSize_Default;
 
-static bool             gStream_Input_IsActive = true;
-static bool             gStream_Output_IsActive = true;
+static _Atomic bool     gStream_Input_IsActive = true;
+static _Atomic bool     gStream_Output_IsActive = true;
 
-// Interleaved Float32 ring buffer shared between WriteMix and ReadInput.
-static Float32          gRingBuffer[kRingBufferSampleCount];
+// Each slot carries its absolute sample time, so a missing write produces
+// silence rather than replaying audio from a previous lap. Atomic samples and
+// a sequence counter make overlapping read/write safe without a realtime lock.
+// Sequential consistency keeps the two sequence checks ordered around samples.
+_Static_assert(ATOMIC_LLONG_LOCK_FREE == 2 && ATOMIC_INT_LOCK_FREE == 2,
+               "The audio path requires lock-free 32/64-bit atomics");
+typedef struct {
+    _Atomic unsigned long long sequence;
+    _Atomic unsigned long long sampleTime;
+    _Atomic unsigned int samples[kChannelCount];
+} MSFFrame;
+static MSFFrame gRingBuffer[kRingBufferFrameCount];
+
+static void MSF_ClearRing(void) {
+    // Called before the host starts IO, never concurrently with audio callbacks.
+    for (UInt32 i = 0; i < kRingBufferFrameCount; ++i) {
+        atomic_store(&gRingBuffer[i].sequence, 0);
+        atomic_store(&gRingBuffer[i].sampleTime, ULLONG_MAX);
+        for (UInt32 c = 0; c < kChannelCount; ++c) atomic_store(&gRingBuffer[i].samples[c], 0);
+    }
+}
 
 // Master output volume (0..1 linear scalar) exposed as a volume control
 // on the device. Written by coreaudiod on behalf of hardware volume keys
 // and by the helper app's slider; read by the helper app to mirror onto
 // the real output device. The driver itself does not attenuate audio.
 static Float32          gVolume_OutputMaster = 1.0f;
+static _Atomic bool     gMute_OutputMaster = false;
 
 // dB range reported by the output volume control.
 static const Float32    kVolume_MinDB = -96.0f;
@@ -170,7 +192,7 @@ __attribute__((visibility("default")))
 void* MacStereoFix_Create(CFAllocatorRef inAllocator, CFUUIDRef inRequestedTypeUUID)
 {
     (void)inAllocator;
-    if (!CFEqual(inRequestedTypeUUID, kAudioServerPlugInTypeUUID)) {
+    if (inRequestedTypeUUID == NULL || !CFEqual(inRequestedTypeUUID, kAudioServerPlugInTypeUUID)) {
         return NULL;
     }
     return gAudioServerPlugInDriverRef;
@@ -182,6 +204,7 @@ static HRESULT MacStereoFix_QueryInterface(void* inDriver, REFIID inUUID, LPVOID
 {
     if (inDriver != gAudioServerPlugInDriverRef) return kAudioHardwareBadObjectError;
     if (outInterface == NULL) return kAudioHardwareIllegalOperationError;
+    *outInterface = NULL;
 
     CFUUIDRef theRequestedUUID = CFUUIDCreateFromUUIDBytes(NULL, inUUID);
     if (theRequestedUUID == NULL) return kAudioHardwareIllegalOperationError;
@@ -189,7 +212,7 @@ static HRESULT MacStereoFix_QueryInterface(void* inDriver, REFIID inUUID, LPVOID
     HRESULT theAnswer = 0;
     if (CFEqual(theRequestedUUID, IUnknownUUID) || CFEqual(theRequestedUUID, kAudioServerPlugInDriverInterfaceUUID)) {
         pthread_mutex_lock(&gPlugIn_StateMutex);
-        ++gPlugIn_RefCount;
+        if (gPlugIn_RefCount < UINT32_MAX) ++gPlugIn_RefCount;
         pthread_mutex_unlock(&gPlugIn_StateMutex);
         *outInterface = gAudioServerPlugInDriverRef;
     } else {
@@ -234,7 +257,7 @@ static OSStatus MacStereoFix_Initialize(AudioServerPlugInDriverRef inDriver, Aud
     gDevice_HostTicksPerFrame = theHostClockFrequency / kSampleRate;
 
     // Zero the ring buffer
-    memset(gRingBuffer, 0, sizeof(gRingBuffer));
+    MSF_ClearRing();
 
     // Default box name
     if (gBox_Name == NULL) {
@@ -333,6 +356,7 @@ static Boolean MacStereoFix_HasProperty(AudioServerPlugInDriverRef inDriver, Aud
                 case kAudioObjectPropertyBaseClass:
                 case kAudioObjectPropertyClass:
                 case kAudioObjectPropertyOwner:
+                case kAudioObjectPropertyFirmwareVersion:
                 case kAudioObjectPropertyName:
                 case kAudioObjectPropertyManufacturer:
                 case kAudioObjectPropertyOwnedObjects:
@@ -383,6 +407,7 @@ static Boolean MacStereoFix_HasProperty(AudioServerPlugInDriverRef inDriver, Aud
             break;
 
         case kObjectID_Volume_Output_Master:
+        case kObjectID_Mute_Output_Master:
             switch (inAddress->mSelector) {
                 case kAudioObjectPropertyBaseClass:
                 case kAudioObjectPropertyClass:
@@ -390,12 +415,15 @@ static Boolean MacStereoFix_HasProperty(AudioServerPlugInDriverRef inDriver, Aud
                 case kAudioObjectPropertyOwnedObjects:
                 case kAudioControlPropertyScope:
                 case kAudioControlPropertyElement:
+                    return true;
+                case kAudioBooleanControlPropertyValue:
+                    return inObjectID == kObjectID_Mute_Output_Master;
                 case kAudioLevelControlPropertyScalarValue:
                 case kAudioLevelControlPropertyDecibelValue:
                 case kAudioLevelControlPropertyDecibelRange:
                 case kAudioLevelControlPropertyConvertScalarToDecibels:
                 case kAudioLevelControlPropertyConvertDecibelsToScalar:
-                    return true;
+                    return inObjectID == kObjectID_Volume_Output_Master;
             }
             break;
     }
@@ -407,18 +435,13 @@ static OSStatus MacStereoFix_IsPropertySettable(AudioServerPlugInDriverRef inDri
     (void)inClientProcessID;
     if (inDriver != gAudioServerPlugInDriverRef) return kAudioHardwareBadObjectError;
     if (inAddress == NULL || outIsSettable == NULL) return kAudioHardwareIllegalOperationError;
+    if (!MacStereoFix_HasProperty(inDriver, inObjectID, inClientProcessID, inAddress))
+        return kAudioHardwareUnknownPropertyError;
 
     *outIsSettable = false;
     switch (inObjectID) {
         case kObjectID_Box:
-            if (inAddress->mSelector == kAudioObjectPropertyName ||
-                inAddress->mSelector == kAudioObjectPropertyIdentify ||
-                inAddress->mSelector == kAudioBoxPropertyAcquired) {
-                *outIsSettable = true;
-            }
-            break;
-        case kObjectID_Device:
-            if (inAddress->mSelector == kAudioDevicePropertyBufferFrameSize) {
+            if (inAddress->mSelector == kAudioObjectPropertyIdentify) {
                 *outIsSettable = true;
             }
             break;
@@ -429,6 +452,9 @@ static OSStatus MacStereoFix_IsPropertySettable(AudioServerPlugInDriverRef inDri
                 inAddress->mSelector == kAudioStreamPropertyPhysicalFormat) {
                 *outIsSettable = true;
             }
+            break;
+        case kObjectID_Mute_Output_Master:
+            *outIsSettable = inAddress->mSelector == kAudioBooleanControlPropertyValue;
             break;
         case kObjectID_Volume_Output_Master:
             if (inAddress->mSelector == kAudioLevelControlPropertyScalarValue ||
@@ -447,6 +473,10 @@ static OSStatus MacStereoFix_GetPropertyDataSize(AudioServerPlugInDriverRef inDr
     if (inAddress == NULL || outDataSize == NULL) return kAudioHardwareIllegalOperationError;
 
     *outDataSize = 0;
+    if (inObjectID < kObjectID_PlugIn || inObjectID > kObjectID_Mute_Output_Master)
+        return kAudioHardwareBadObjectError;
+    if (!MacStereoFix_HasProperty(inDriver, inObjectID, inClientProcessID, inAddress))
+        return kAudioHardwareUnknownPropertyError;
 
     switch (inObjectID) {
         case kObjectID_PlugIn:
@@ -455,7 +485,7 @@ static OSStatus MacStereoFix_GetPropertyDataSize(AudioServerPlugInDriverRef inDr
                 case kAudioObjectPropertyClass:                     *outDataSize = sizeof(AudioClassID); break;
                 case kAudioObjectPropertyOwner:                     *outDataSize = sizeof(AudioObjectID); break;
                 case kAudioObjectPropertyManufacturer:              *outDataSize = sizeof(CFStringRef); break;
-                case kAudioObjectPropertyOwnedObjects:              *outDataSize = sizeof(AudioObjectID); break;
+                case kAudioObjectPropertyOwnedObjects:              *outDataSize = 2 * sizeof(AudioObjectID); break;
                 case kAudioPlugInPropertyBoxList:                   *outDataSize = sizeof(AudioObjectID); break;
                 case kAudioPlugInPropertyTranslateUIDToBox:         *outDataSize = sizeof(AudioObjectID); break;
                 case kAudioPlugInPropertyDeviceList:                *outDataSize = sizeof(AudioObjectID); break;
@@ -500,9 +530,10 @@ static OSStatus MacStereoFix_GetPropertyDataSize(AudioServerPlugInDriverRef inDr
                 case kAudioObjectPropertyBaseClass:                 *outDataSize = sizeof(AudioClassID); break;
                 case kAudioObjectPropertyClass:                     *outDataSize = sizeof(AudioClassID); break;
                 case kAudioObjectPropertyOwner:                     *outDataSize = sizeof(AudioObjectID); break;
+                case kAudioObjectPropertyFirmwareVersion:           *outDataSize = sizeof(CFStringRef); break;
                 case kAudioObjectPropertyName:                      *outDataSize = sizeof(CFStringRef); break;
                 case kAudioObjectPropertyManufacturer:              *outDataSize = sizeof(CFStringRef); break;
-                case kAudioObjectPropertyOwnedObjects:              *outDataSize = 3 * sizeof(AudioObjectID); break;
+                case kAudioObjectPropertyOwnedObjects:              *outDataSize = 4 * sizeof(AudioObjectID); break;
                 case kAudioDevicePropertyDeviceUID:                 *outDataSize = sizeof(CFStringRef); break;
                 case kAudioDevicePropertyModelUID:                  *outDataSize = sizeof(CFStringRef); break;
                 case kAudioDevicePropertyTransportType:             *outDataSize = sizeof(UInt32); break;
@@ -524,7 +555,7 @@ static OSStatus MacStereoFix_GetPropertyDataSize(AudioServerPlugInDriverRef inDr
                 case kAudioObjectPropertyControlList:
                     if (inAddress->mScope == kAudioObjectPropertyScopeGlobal ||
                         inAddress->mScope == kAudioObjectPropertyScopeOutput) {
-                        *outDataSize = sizeof(AudioObjectID);
+                        *outDataSize = 2 * sizeof(AudioObjectID);
                     } else {
                         *outDataSize = 0;
                     }
@@ -564,6 +595,7 @@ static OSStatus MacStereoFix_GetPropertyDataSize(AudioServerPlugInDriverRef inDr
             break;
 
         case kObjectID_Volume_Output_Master:
+        case kObjectID_Mute_Output_Master:
             switch (inAddress->mSelector) {
                 case kAudioObjectPropertyBaseClass:                     *outDataSize = sizeof(AudioClassID); break;
                 case kAudioObjectPropertyClass:                         *outDataSize = sizeof(AudioClassID); break;
@@ -571,6 +603,7 @@ static OSStatus MacStereoFix_GetPropertyDataSize(AudioServerPlugInDriverRef inDr
                 case kAudioObjectPropertyOwnedObjects:                  *outDataSize = 0; break;
                 case kAudioControlPropertyScope:                        *outDataSize = sizeof(AudioObjectPropertyScope); break;
                 case kAudioControlPropertyElement:                      *outDataSize = sizeof(AudioObjectPropertyElement); break;
+                case kAudioBooleanControlPropertyValue:                 *outDataSize = sizeof(UInt32); break;
                 case kAudioLevelControlPropertyScalarValue:             *outDataSize = sizeof(Float32); break;
                 case kAudioLevelControlPropertyDecibelValue:            *outDataSize = sizeof(Float32); break;
                 case kAudioLevelControlPropertyDecibelRange:            *outDataSize = sizeof(AudioValueRange); break;
@@ -591,6 +624,23 @@ static OSStatus MacStereoFix_GetPropertyData(AudioServerPlugInDriverRef inDriver
     (void)inClientProcessID;
     if (inDriver != gAudioServerPlugInDriverRef) return kAudioHardwareBadObjectError;
     if (inAddress == NULL || outDataSize == NULL || outData == NULL) return kAudioHardwareIllegalOperationError;
+    *outDataSize = 0;
+
+    // One shared check covers every scalar, string and structure response.
+    // Lists may return a whole-element prefix that fits the caller's capacity.
+    UInt32 required = 0;
+    OSStatus sizeStatus = MacStereoFix_GetPropertyDataSize(inDriver, inObjectID,
+        inClientProcessID, inAddress, inQualifierDataSize, inQualifierData, &required);
+    if (sizeStatus != noErr) return sizeStatus;
+    bool isList = inAddress->mSelector == kAudioObjectPropertyOwnedObjects ||
+        inAddress->mSelector == kAudioPlugInPropertyBoxList ||
+        inAddress->mSelector == kAudioPlugInPropertyDeviceList ||
+        inAddress->mSelector == kAudioBoxPropertyDeviceList ||
+        inAddress->mSelector == kAudioDevicePropertyRelatedDevices ||
+        inAddress->mSelector == kAudioDevicePropertyStreams ||
+        inAddress->mSelector == kAudioObjectPropertyControlList ||
+        inAddress->mSelector == kAudioDevicePropertyAvailableNominalSampleRates;
+    if (!isList && inDataSize < required) return kAudioHardwareBadPropertySizeError;
 
     UInt32 written = 0;
     OSStatus status = kAudioHardwareNoError;
@@ -622,7 +672,8 @@ static OSStatus MacStereoFix_GetPropertyData(AudioServerPlugInDriverRef inDriver
             case kAudioObjectPropertyOwnedObjects: {
                 UInt32 count = inDataSize / sizeof(AudioObjectID);
                 if (count >= 1) ((AudioObjectID*)outData)[0] = kObjectID_Box;
-                written = (count >= 1 ? 1 : 0) * sizeof(AudioObjectID);
+                if (count >= 2) ((AudioObjectID*)outData)[1] = kObjectID_Device;
+                written = (count >= 2 ? 2 : count) * sizeof(AudioObjectID);
                 break;
             }
             case kAudioPlugInPropertyBoxList: {
@@ -635,6 +686,7 @@ static OSStatus MacStereoFix_GetPropertyData(AudioServerPlugInDriverRef inDriver
                 if (inQualifierDataSize != sizeof(CFStringRef) || inQualifierData == NULL) return kAudioHardwareBadPropertySizeError;
                 if (inDataSize < sizeof(AudioObjectID)) return kAudioHardwareBadPropertySizeError;
                 CFStringRef uid = *((CFStringRef*)inQualifierData);
+                if (uid != NULL && CFGetTypeID(uid) != CFStringGetTypeID()) return kAudioHardwareIllegalOperationError;
                 if (uid != NULL && CFStringCompare(uid, CFSTR(kBox_UID), 0) == kCFCompareEqualTo) {
                     *((AudioObjectID*)outData) = kObjectID_Box;
                 } else {
@@ -658,6 +710,7 @@ static OSStatus MacStereoFix_GetPropertyData(AudioServerPlugInDriverRef inDriver
                 if (inQualifierDataSize != sizeof(CFStringRef) || inQualifierData == NULL) return kAudioHardwareBadPropertySizeError;
                 if (inDataSize < sizeof(AudioObjectID)) return kAudioHardwareBadPropertySizeError;
                 CFStringRef uid = *((CFStringRef*)inQualifierData);
+                if (uid != NULL && CFGetTypeID(uid) != CFStringGetTypeID()) return kAudioHardwareIllegalOperationError;
                 if (uid != NULL && CFStringCompare(uid, CFSTR(kDevice_UID), 0) == kCFCompareEqualTo) {
                     *((AudioObjectID*)outData) = kObjectID_Device;
                 } else {
@@ -781,6 +834,10 @@ static OSStatus MacStereoFix_GetPropertyData(AudioServerPlugInDriverRef inDriver
                 *((AudioObjectID*)outData) = kObjectID_PlugIn;
                 written = sizeof(AudioObjectID);
                 break;
+            case kAudioObjectPropertyFirmwareVersion:
+                *((CFStringRef*)outData) = CFSTR(kDriverVersion);
+                written = sizeof(CFStringRef);
+                break;
             case kAudioObjectPropertyName:
                 *((CFStringRef*)outData) = CFSTR(kDevice_Name);
                 written = sizeof(CFStringRef);
@@ -791,10 +848,11 @@ static OSStatus MacStereoFix_GetPropertyData(AudioServerPlugInDriverRef inDriver
                 break;
             case kAudioObjectPropertyOwnedObjects: {
                 UInt32 maxCount = inDataSize / sizeof(AudioObjectID);
-                if (maxCount > 3) maxCount = 3;
+                if (maxCount > 4) maxCount = 4;
                 if (maxCount >= 1) ((AudioObjectID*)outData)[0] = kObjectID_Stream_Input;
                 if (maxCount >= 2) ((AudioObjectID*)outData)[1] = kObjectID_Stream_Output;
                 if (maxCount >= 3) ((AudioObjectID*)outData)[2] = kObjectID_Volume_Output_Master;
+                if (maxCount >= 4) ((AudioObjectID*)outData)[3] = kObjectID_Mute_Output_Master;
                 written = maxCount * sizeof(AudioObjectID);
                 break;
             }
@@ -833,11 +891,13 @@ static OSStatus MacStereoFix_GetPropertyData(AudioServerPlugInDriverRef inDriver
                 break;
             }
             case kAudioDevicePropertyDeviceCanBeDefaultDevice:
-                *((UInt32*)outData) = 1;
+                *((UInt32*)outData) = inAddress->mScope == kAudioObjectPropertyScopeOutput ? 1 : 0;
                 written = sizeof(UInt32);
                 break;
             case kAudioDevicePropertyDeviceCanBeDefaultSystemDevice:
-                *((UInt32*)outData) = 1;
+                // Keep alerts on the user's physical system output. The app
+                // only owns the normal default output, never the input device.
+                *((UInt32*)outData) = 0;
                 written = sizeof(UInt32);
                 break;
             case kAudioDevicePropertyLatency:
@@ -862,7 +922,8 @@ static OSStatus MacStereoFix_GetPropertyData(AudioServerPlugInDriverRef inDriver
                      inAddress->mScope == kAudioObjectPropertyScopeOutput) &&
                     maxCount >= 1) {
                     ((AudioObjectID*)outData)[0] = kObjectID_Volume_Output_Master;
-                    written = sizeof(AudioObjectID);
+                    if (maxCount >= 2) ((AudioObjectID*)outData)[1] = kObjectID_Mute_Output_Master;
+                    written = (maxCount >= 2 ? 2 : 1) * sizeof(AudioObjectID);
                 } else {
                     written = 0;
                 }
@@ -1036,15 +1097,16 @@ static OSStatus MacStereoFix_GetPropertyData(AudioServerPlugInDriverRef inDriver
     }
 
     case kObjectID_Volume_Output_Master:
+    case kObjectID_Mute_Output_Master:
         switch (inAddress->mSelector) {
             case kAudioObjectPropertyBaseClass:
                 if (inDataSize < sizeof(AudioClassID)) return kAudioHardwareBadPropertySizeError;
-                *((AudioClassID*)outData) = kAudioLevelControlClassID;
+                *((AudioClassID*)outData) = inObjectID == kObjectID_Mute_Output_Master ? kAudioBooleanControlClassID : kAudioLevelControlClassID;
                 written = sizeof(AudioClassID);
                 break;
             case kAudioObjectPropertyClass:
                 if (inDataSize < sizeof(AudioClassID)) return kAudioHardwareBadPropertySizeError;
-                *((AudioClassID*)outData) = kAudioVolumeControlClassID;
+                *((AudioClassID*)outData) = inObjectID == kObjectID_Mute_Output_Master ? kAudioMuteControlClassID : kAudioVolumeControlClassID;
                 written = sizeof(AudioClassID);
                 break;
             case kAudioObjectPropertyOwner:
@@ -1064,6 +1126,10 @@ static OSStatus MacStereoFix_GetPropertyData(AudioServerPlugInDriverRef inDriver
                 if (inDataSize < sizeof(AudioObjectPropertyElement)) return kAudioHardwareBadPropertySizeError;
                 *((AudioObjectPropertyElement*)outData) = kAudioObjectPropertyElementMain;
                 written = sizeof(AudioObjectPropertyElement);
+                break;
+            case kAudioBooleanControlPropertyValue:
+                *((UInt32*)outData) = atomic_load(&gMute_OutputMaster) ? 1 : 0;
+                written = sizeof(UInt32);
                 break;
             case kAudioLevelControlPropertyScalarValue: {
                 if (inDataSize < sizeof(Float32)) return kAudioHardwareBadPropertySizeError;
@@ -1095,6 +1161,7 @@ static OSStatus MacStereoFix_GetPropertyData(AudioServerPlugInDriverRef inDriver
                 // it with the equivalent dB value.
                 if (inDataSize < sizeof(Float32)) return kAudioHardwareBadPropertySizeError;
                 Float32 scalar = *((Float32*)outData);
+                if (!isfinite(scalar)) return kAudioHardwareIllegalOperationError;
                 if (scalar < 0.0f) scalar = 0.0f;
                 if (scalar > 1.0f) scalar = 1.0f;
                 *((Float32*)outData) = MSF_VolumeScalarToDB(scalar);
@@ -1106,6 +1173,7 @@ static OSStatus MacStereoFix_GetPropertyData(AudioServerPlugInDriverRef inDriver
                 // with the equivalent scalar value.
                 if (inDataSize < sizeof(Float32)) return kAudioHardwareBadPropertySizeError;
                 Float32 dB = *((Float32*)outData);
+                if (!isfinite(dB)) return kAudioHardwareIllegalOperationError;
                 *((Float32*)outData) = MSF_VolumeDBToScalar(dB);
                 written = sizeof(Float32);
                 break;
@@ -1130,56 +1198,18 @@ static OSStatus MacStereoFix_SetPropertyData(AudioServerPlugInDriverRef inDriver
     (void)inClientProcessID; (void)inQualifierDataSize; (void)inQualifierData;
     if (inDriver != gAudioServerPlugInDriverRef) return kAudioHardwareBadObjectError;
     if (inAddress == NULL || inData == NULL) return kAudioHardwareIllegalOperationError;
+    Boolean settable = false;
+    OSStatus settableStatus = MacStereoFix_IsPropertySettable(inDriver, inObjectID,
+        inClientProcessID, inAddress, &settable);
+    if (settableStatus != noErr) return settableStatus;
+    if (!settable) return kAudioHardwareIllegalOperationError;
 
     switch (inObjectID) {
         case kObjectID_Box:
             switch (inAddress->mSelector) {
-                case kAudioObjectPropertyName: {
-                    if (inDataSize != sizeof(CFStringRef)) return kAudioHardwareBadPropertySizeError;
-                    CFStringRef newName = *((CFStringRef*)inData);
-                    pthread_mutex_lock(&gPlugIn_StateMutex);
-                    if (gBox_Name != NULL) CFRelease(gBox_Name);
-                    if (newName != NULL) CFRetain(newName);
-                    gBox_Name = newName;
-                    pthread_mutex_unlock(&gPlugIn_StateMutex);
-                    return kAudioHardwareNoError;
-                }
                 case kAudioObjectPropertyIdentify:
-                    return kAudioHardwareNoError;
-                case kAudioBoxPropertyAcquired: {
                     if (inDataSize != sizeof(UInt32)) return kAudioHardwareBadPropertySizeError;
-                    pthread_mutex_lock(&gPlugIn_StateMutex);
-                    gBox_Acquired = (*(UInt32*)inData != 0);
-                    pthread_mutex_unlock(&gPlugIn_StateMutex);
                     return kAudioHardwareNoError;
-                }
-            }
-            break;
-
-        case kObjectID_Device:
-            switch (inAddress->mSelector) {
-                case kAudioDevicePropertyBufferFrameSize: {
-                    if (inDataSize != sizeof(UInt32)) return kAudioHardwareBadPropertySizeError;
-                    UInt32 requested = *((const UInt32*)inData);
-                    if (requested < kBufferFrameSize_Min) requested = kBufferFrameSize_Min;
-                    if (requested > kBufferFrameSize_Max) requested = kBufferFrameSize_Max;
-                    bool changed = false;
-                    pthread_mutex_lock(&gPlugIn_StateMutex);
-                    if (gDevice_BufferFrameSize != requested) {
-                        gDevice_BufferFrameSize = requested;
-                        changed = true;
-                    }
-                    pthread_mutex_unlock(&gPlugIn_StateMutex);
-                    if (changed && gPlugIn_Host != NULL) {
-                        AudioObjectPropertyAddress changedAddr = {
-                            kAudioDevicePropertyBufferFrameSize,
-                            kAudioObjectPropertyScopeGlobal,
-                            kAudioObjectPropertyElementMain
-                        };
-                        gPlugIn_Host->PropertiesChanged(gPlugIn_Host, kObjectID_Device, 1, &changedAddr);
-                    }
-                    return kAudioHardwareNoError;
-                }
             }
             break;
 
@@ -1193,6 +1223,10 @@ static OSStatus MacStereoFix_SetPropertyData(AudioServerPlugInDriverRef inDriver
                     if (inObjectID == kObjectID_Stream_Input) gStream_Input_IsActive = active;
                     else gStream_Output_IsActive = active;
                     pthread_mutex_unlock(&gPlugIn_StateMutex);
+                    if (gPlugIn_Host != NULL) {
+                        AudioObjectPropertyAddress changed = *inAddress;
+                        gPlugIn_Host->PropertiesChanged(gPlugIn_Host, inObjectID, 1, &changed);
+                    }
                     return kAudioHardwareNoError;
                 }
                 case kAudioStreamPropertyVirtualFormat:
@@ -1202,16 +1236,31 @@ static OSStatus MacStereoFix_SetPropertyData(AudioServerPlugInDriverRef inDriver
                     if (fmt->mFormatID != kAudioFormatLinearPCM) return kAudioDeviceUnsupportedFormatError;
                     if (fmt->mChannelsPerFrame != kChannelCount) return kAudioDeviceUnsupportedFormatError;
                     if (fmt->mSampleRate != kSampleRate) return kAudioHardwareIllegalOperationError;
+                    if (fmt->mFormatFlags != (kAudioFormatFlagIsFloat | kAudioFormatFlagsNativeEndian | kAudioFormatFlagIsPacked) ||
+                        fmt->mBytesPerPacket != kBytesPerFrame || fmt->mFramesPerPacket != 1 ||
+                        fmt->mBytesPerFrame != kBytesPerFrame || fmt->mBitsPerChannel != 32)
+                        return kAudioDeviceUnsupportedFormatError;
                     return kAudioHardwareNoError;
                 }
             }
             break;
 
         case kObjectID_Volume_Output_Master:
+        case kObjectID_Mute_Output_Master:
             switch (inAddress->mSelector) {
+                case kAudioBooleanControlPropertyValue: {
+                    if (inDataSize != sizeof(UInt32)) return kAudioHardwareBadPropertySizeError;
+                    bool muted = *((const UInt32*)inData) != 0;
+                    if (atomic_exchange(&gMute_OutputMaster, muted) != muted && gPlugIn_Host != NULL) {
+                        AudioObjectPropertyAddress changed = *inAddress;
+                        gPlugIn_Host->PropertiesChanged(gPlugIn_Host, inObjectID, 1, &changed);
+                    }
+                    return kAudioHardwareNoError;
+                }
                 case kAudioLevelControlPropertyScalarValue: {
                     if (inDataSize != sizeof(Float32)) return kAudioHardwareBadPropertySizeError;
                     Float32 newScalar = *((const Float32*)inData);
+                    if (!isfinite(newScalar)) return kAudioHardwareIllegalOperationError;
                     if (newScalar < 0.0f) newScalar = 0.0f;
                     if (newScalar > 1.0f) newScalar = 1.0f;
                     bool changed = false;
@@ -1239,6 +1288,7 @@ static OSStatus MacStereoFix_SetPropertyData(AudioServerPlugInDriverRef inDriver
                 case kAudioLevelControlPropertyDecibelValue: {
                     if (inDataSize != sizeof(Float32)) return kAudioHardwareBadPropertySizeError;
                     Float32 newDB = *((const Float32*)inData);
+                    if (!isfinite(newDB)) return kAudioHardwareIllegalOperationError;
                     if (newDB < kVolume_MinDB) newDB = kVolume_MinDB;
                     if (newDB > kVolume_MaxDB) newDB = kVolume_MaxDB;
                     Float32 newScalar = MSF_VolumeDBToScalar(newDB);
@@ -1276,10 +1326,9 @@ static OSStatus MacStereoFix_StartIO(AudioServerPlugInDriverRef inDriver, AudioO
 
     pthread_mutex_lock(&gPlugIn_StateMutex);
     if (gDevice_IOIsRunning == 0) {
-        gDevice_NumberTimeStamps = 0;
-        gDevice_AnchorSampleTime = 0.0;
-        gDevice_AnchorHostTime = mach_absolute_time();
-        memset(gRingBuffer, 0, sizeof(gRingBuffer));
+        atomic_store(&gDevice_AnchorHostTime, mach_absolute_time());
+        atomic_fetch_add(&gDevice_TimeStampSeed, 1);
+        MSF_ClearRing();
     }
     ++gDevice_IOIsRunning;
     pthread_mutex_unlock(&gPlugIn_StateMutex);
@@ -1305,20 +1354,16 @@ static OSStatus MacStereoFix_GetZeroTimeStamp(AudioServerPlugInDriverRef inDrive
     if (inDeviceObjectID != kObjectID_Device) return kAudioHardwareBadObjectError;
     if (outSampleTime == NULL || outHostTime == NULL || outSeed == NULL) return kAudioHardwareIllegalOperationError;
 
-    // No lock here: GetZeroTimeStamp is on the audio realtime path. The host
-    // serialises calls per device, and gDevice_NumberTimeStamps /
-    // gDevice_AnchorHostTime are only ever written from this function (or
-    // reset under lock in StartIO before IO begins).
+    // Derive the timestamp from elapsed time so sleep or a delayed callback
+    // catches up in one call instead of advancing one period at a time.
     UInt64 currentHostTime = mach_absolute_time();
+    UInt64 anchor = atomic_load(&gDevice_AnchorHostTime);
     Float64 hostTicksPerRingBuffer = gDevice_HostTicksPerFrame * (Float64)kRingBufferFrameCount;
-    Float64 hostTickOffset = ((Float64)gDevice_NumberTimeStamps + 1.0) * hostTicksPerRingBuffer;
-    UInt64 nextHostTime = gDevice_AnchorHostTime + (UInt64)hostTickOffset;
-    if (nextHostTime <= currentHostTime) {
-        ++gDevice_NumberTimeStamps;
-    }
-    *outSampleTime = gDevice_NumberTimeStamps * (Float64)kRingBufferFrameCount;
-    *outHostTime = gDevice_AnchorHostTime + (UInt64)((Float64)gDevice_NumberTimeStamps * hostTicksPerRingBuffer);
-    *outSeed = 1;
+    if (hostTicksPerRingBuffer <= 0 || currentHostTime < anchor) return kAudioHardwareIllegalOperationError;
+    UInt64 periods = (UInt64)((currentHostTime - anchor) / hostTicksPerRingBuffer);
+    *outSampleTime = periods * (Float64)kRingBufferFrameCount;
+    *outHostTime = anchor + (UInt64)(periods * hostTicksPerRingBuffer);
+    *outSeed = atomic_load(&gDevice_TimeStampSeed);
     return kAudioHardwareNoError;
 }
 
@@ -1357,44 +1402,51 @@ static OSStatus MacStereoFix_DoIOOperation(AudioServerPlugInDriverRef inDriver, 
     if (inDeviceObjectID != kObjectID_Device) return kAudioHardwareBadObjectError;
     if (ioMainBuffer == NULL || inIOCycleInfo == NULL) return kAudioHardwareIllegalOperationError;
 
-    if (inOperationID == kAudioServerPlugInIOOperationWriteMix && inStreamObjectID == kObjectID_Stream_Output) {
-        // Game writing into the device output goes into the ring buffer.
-        Float64 sampleTime = inIOCycleInfo->mOutputTime.mSampleTime;
-        UInt64 startFrame = ((UInt64)sampleTime) % kRingBufferFrameCount;
-        UInt32 framesRemaining = inIOBufferFrameSize;
-        const Float32* src = (const Float32*)ioMainBuffer;
-        UInt64 cursor = startFrame;
-        while (framesRemaining > 0) {
-            UInt32 framesUntilWrap = (UInt32)(kRingBufferFrameCount - cursor);
-            UInt32 chunk = framesRemaining < framesUntilWrap ? framesRemaining : framesUntilWrap;
-            memcpy(&gRingBuffer[cursor * kChannelCount], src, chunk * kBytesPerFrame);
-            src += chunk * kChannelCount;
-            framesRemaining -= chunk;
-            cursor += chunk;
-            if (cursor >= kRingBufferFrameCount) cursor = 0;
-        }
+    bool writing = inOperationID == kAudioServerPlugInIOOperationWriteMix;
+    bool reading = inOperationID == kAudioServerPlugInIOOperationReadInput;
+    if (!writing && !reading) return kAudioHardwareUnsupportedOperationError;
+    if (inStreamObjectID != (writing ? kObjectID_Stream_Output : kObjectID_Stream_Input))
+        return kAudioHardwareBadObjectError;
+    if (inIOBufferFrameSize > kRingBufferFrameCount) return kAudioHardwareIllegalOperationError;
+    Float64 sampleTime = writing ? inIOCycleInfo->mOutputTime.mSampleTime : inIOCycleInfo->mInputTime.mSampleTime;
+    // Limit to exactly representable integral times and leave room for this cycle.
+    if (!isfinite(sampleTime) || sampleTime > 0x1p53 - kRingBufferFrameCount ||
+        floor(sampleTime) != sampleTime) return kAudioHardwareIllegalOperationError;
+    // The host may preroll with a negative sample time at startup. There is
+    // no audio before our anchor; return silence without an invalid conversion.
+    if (sampleTime < 0) {
+        if (reading) memset(ioMainBuffer, 0, inIOBufferFrameSize * kBytesPerFrame);
         return kAudioHardwareNoError;
     }
-
-    if (inOperationID == kAudioServerPlugInIOOperationReadInput && inStreamObjectID == kObjectID_Stream_Input) {
-        // Helper app reading from the device input pulls from the ring buffer.
-        Float64 sampleTime = inIOCycleInfo->mInputTime.mSampleTime;
-        UInt64 startFrame = ((UInt64)sampleTime) % kRingBufferFrameCount;
-        UInt32 framesRemaining = inIOBufferFrameSize;
-        Float32* dst = (Float32*)ioMainBuffer;
-        UInt64 cursor = startFrame;
-        while (framesRemaining > 0) {
-            UInt32 framesUntilWrap = (UInt32)(kRingBufferFrameCount - cursor);
-            UInt32 chunk = framesRemaining < framesUntilWrap ? framesRemaining : framesUntilWrap;
-            memcpy(dst, &gRingBuffer[cursor * kChannelCount], chunk * kBytesPerFrame);
-            dst += chunk * kChannelCount;
-            framesRemaining -= chunk;
-            cursor += chunk;
-            if (cursor >= kRingBufferFrameCount) cursor = 0;
+    UInt64 first = (UInt64)sampleTime;
+    Float32* samples = (Float32*)ioMainBuffer;
+    bool active = atomic_load(writing ? &gStream_Output_IsActive : &gStream_Input_IsActive);
+    for (UInt32 i = 0; i < inIOBufferFrameSize; ++i) {
+        UInt64 time = first + i;
+        MSFFrame* frame = &gRingBuffer[time % kRingBufferFrameCount];
+        if (writing) {
+            // The host supplies one fully mixed output writer for this device.
+            atomic_fetch_add(&frame->sequence, 1); // odd: write in progress
+            for (UInt32 c = 0; c < kChannelCount; ++c) {
+                Float32 sample = active && isfinite(samples[i * kChannelCount + c])
+                    ? samples[i * kChannelCount + c] : 0;
+                unsigned int bits;
+                memcpy(&bits, &sample, sizeof(bits));
+                atomic_store(&frame->samples[c], bits);
+            }
+            atomic_store(&frame->sampleTime, time);
+            atomic_fetch_add(&frame->sequence, 1); // even: complete
+        } else {
+            unsigned long long sequence = atomic_load(&frame->sequence);
+            bool valid = active && !(sequence & 1) && atomic_load(&frame->sampleTime) == time;
+            for (UInt32 c = 0; c < kChannelCount; ++c) {
+                unsigned int bits = atomic_load(&frame->samples[c]);
+                memcpy(&samples[i * kChannelCount + c], &bits, sizeof(bits));
+            }
+            if (!valid || atomic_load(&frame->sequence) != sequence)
+                memset(&samples[i * kChannelCount], 0, kBytesPerFrame);
         }
-        return kAudioHardwareNoError;
     }
-
     return kAudioHardwareNoError;
 }
 

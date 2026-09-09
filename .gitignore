@@ -11,3 +11,7 @@ xcuserdata/
 
 # Editor / tool config
 .claude/
+
+# Local test binaries
+.checks/
+__pycache__/

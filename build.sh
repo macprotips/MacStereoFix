@@ -1,15 +1,8 @@
 #!/usr/bin/env bash
 #
-# build.sh — builds MacStereoFix.driver and MacStereoFix.app from source.
-#
-# Output goes into ./build/. After running this you can:
-#   sudo ./install.sh         # copy driver into /Library/Audio/Plug-Ins/HAL
-# and then drag build/MacStereoFix.app into /Applications.
-#
-# To produce a signed build for distribution to friends, set:
-#   SIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)"
-# in your environment before running. Without that, the build is ad-hoc signed
-# (works on your own Mac but friends will see Gatekeeper warnings).
+# Build the universal app and audio driver into build/.
+# Set SIGN_IDENTITY to a Developer ID Application identity for a signed build.
+# Without it, the build is ad-hoc signed for local development.
 
 set -euo pipefail
 
@@ -24,7 +17,13 @@ APP_BUNDLE="$BUILD_DIR/MacStereoFix.app"
 MIN_MACOS="13.0"
 ARCHS=( "arm64" "x86_64" )
 
-SIGN_IDENTITY="${SIGN_IDENTITY:--}"   # `-` means ad-hoc
+SIGN_IDENTITY="${SIGN_IDENTITY:--}"   # `-` means local development only
+SIGN_FLAGS=( --force --sign "$SIGN_IDENTITY" --options runtime )
+if [[ "$SIGN_IDENTITY" == - ]]; then
+    SIGN_FLAGS+=( --timestamp=none )
+else
+    SIGN_FLAGS+=( --timestamp )
+fi
 
 echo "==> Cleaning $BUILD_DIR"
 rm -rf "$BUILD_DIR"
@@ -40,6 +39,7 @@ mkdir -p "$DRIVER_BUNDLE/Contents/MacOS"
 mkdir -p "$DRIVER_BUNDLE/Contents/Resources"
 
 cp "$DRIVER_SRC_DIR/Info.plist" "$DRIVER_BUNDLE/Contents/Info.plist"
+cp "$ROOT_DIR/ThirdParty/Apple-NullAudio-LICENSE.txt" "$DRIVER_BUNDLE/Contents/Resources/"
 
 ARCH_FLAGS=()
 for a in "${ARCHS[@]}"; do
@@ -49,7 +49,7 @@ done
 clang \
     -bundle \
     -O2 \
-    -Wall \
+    -Wall -Wextra -Werror \
     -Wno-unused-parameter \
     -fvisibility=hidden \
     "${ARCH_FLAGS[@]}" \
@@ -60,10 +60,7 @@ clang \
     "$DRIVER_SRC_DIR/MacStereoFixDriver.c"
 
 # Sign the driver bundle. Drivers loaded by coreaudiod must be signed.
-codesign --force --sign "$SIGN_IDENTITY" \
-    --timestamp \
-    --options runtime \
-    "$DRIVER_BUNDLE"
+codesign "${SIGN_FLAGS[@]}" "$DRIVER_BUNDLE"
 
 #####################################################################
 # 2. Build the SwiftUI app (.app bundle)
@@ -75,11 +72,26 @@ mkdir -p "$APP_BUNDLE/Contents/MacOS"
 mkdir -p "$APP_BUNDLE/Contents/Resources"
 
 cp "$APP_SRC_DIR/Info.plist" "$APP_BUNDLE/Contents/Info.plist"
+cp "$APP_SRC_DIR/AppIcon.icns" "$APP_BUNDLE/Contents/Resources/"
+cp "$APP_SRC_DIR/PrivacyInfo.xcprivacy" "$APP_BUNDLE/Contents/Resources/"
+cp -R "$ROOT_DIR/ThirdParty" "$APP_BUNDLE/Contents/Resources/"
 
 # Bundle the freshly-built driver inside the app's Resources so the in-app
 # installer can copy it into /Library/Audio/Plug-Ins/HAL when the user clicks
 # "Install Driver".
 cp -R "$DRIVER_BUNDLE" "$APP_BUNDLE/Contents/Resources/MacStereoFix.driver"
+
+# Embed the installer in the signed executable, never run a writable script
+# from Resources with administrator privileges.
+INSTALL_SCRIPT=$(/usr/bin/base64 < "$ROOT_DIR/Scripts/install-driver.sh" | /usr/bin/tr -d '\n')
+UNINSTALL_SCRIPT=$(/usr/bin/base64 < "$ROOT_DIR/Scripts/uninstall-driver.sh" | /usr/bin/tr -d '\n')
+cat > "$BUILD_DIR/InstallerScripts.swift" <<EOF
+import Foundation
+enum InstallerScripts {
+    static let install = String(data: Data(base64Encoded: "$INSTALL_SCRIPT")!, encoding: .utf8)!
+    static let uninstall = String(data: Data(base64Encoded: "$UNINSTALL_SCRIPT")!, encoding: .utf8)!
+}
+EOF
 
 SWIFT_SOURCES=(
     "$APP_SRC_DIR/MacStereoFixApp.swift"
@@ -89,6 +101,10 @@ SWIFT_SOURCES=(
     "$APP_SRC_DIR/RingBuffer.swift"
     "$APP_SRC_DIR/SystemAudio.swift"
     "$APP_SRC_DIR/DriverManager.swift"
+    "$APP_SRC_DIR/AudioObservation.swift"
+    "$APP_SRC_DIR/AudioRecovery.swift"
+    "$APP_SRC_DIR/StereoMix.swift"
+    "$BUILD_DIR/InstallerScripts.swift"
 )
 
 # Build a universal binary by compiling each arch separately and lipo-ing.
@@ -104,6 +120,7 @@ for a in "${ARCHS[@]}"; do
         -framework Foundation \
         -framework CoreAudio \
         -framework AudioToolbox \
+        -framework AVFoundation \
         -framework Combine \
         -o "$OUT" \
         "${SWIFT_SOURCES[@]}"
@@ -113,23 +130,32 @@ done
 lipo -create "${PARTIAL_BINARIES[@]}" -output "$APP_BUNDLE/Contents/MacOS/MacStereoFix"
 rm -f "${PARTIAL_BINARIES[@]}"
 
-# App needs hardened runtime + same identity for distribution.
-# The entitlements file grants microphone access, which is required under
-# hardened runtime to read from the MacStereoFix virtual device's input stream.
-# Without com.apple.security.device.audio-input, TCC silently denies the prompt
-# and AudioUnitRender returns silence.
-codesign --force --sign "$SIGN_IDENTITY" \
-    --timestamp \
-    --options runtime \
-    --entitlements "$APP_SRC_DIR/MacStereoFix.entitlements" \
-    --deep \
-    "$APP_BUNDLE"
+# The recovery helper runs as this user; it has no administrator or audio-input entitlement.
+HELPER_BINARIES=()
+for a in "${ARCHS[@]}"; do
+    OUT="$BUILD_DIR/MacStereoFixRecovery.$a"
+    swiftc -O -target "${a}-apple-macos${MIN_MACOS}" \
+        -framework CoreAudio -framework Foundation \
+        "$ROOT_DIR/Recovery/main.swift" "$APP_SRC_DIR/SystemAudio.swift" -o "$OUT"
+    HELPER_BINARIES+=( "$OUT" )
+done
+lipo -create "${HELPER_BINARIES[@]}" -output "$APP_BUNDLE/Contents/MacOS/MacStereoFixRecovery"
+rm -f "${HELPER_BINARIES[@]}"
+codesign "${SIGN_FLAGS[@]}" --identifier com.macstereofix.recovery \
+    "$APP_BUNDLE/Contents/MacOS/MacStereoFixRecovery"
+
+# Sign inside out. --deep is appropriate for verification, not for signing.
+codesign "${SIGN_FLAGS[@]}" --entitlements "$APP_SRC_DIR/MacStereoFix.entitlements" "$APP_BUNDLE"
+codesign --verify --deep --strict "$APP_BUNDLE"
 
 echo
 echo "==> Build complete:"
 echo "    $DRIVER_BUNDLE"
 echo "    $APP_BUNDLE"
 echo
-echo "Next:"
-echo "  sudo ./install.sh        # install the driver system-wide"
-echo "  cp -R build/MacStereoFix.app /Applications/"
+echo "Next: ./check.sh"
+if [[ "$SIGN_IDENTITY" == - ]]; then
+    echo "Local development only. Explicit local install: sudo ./install.sh --allow-adhoc"
+else
+    echo "Signed test build. Hardware validation and Apple notarization are still required before distribution."
+fi

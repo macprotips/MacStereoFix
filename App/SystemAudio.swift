@@ -43,14 +43,20 @@ enum SystemAudio {
             AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &dataSize, buf.baseAddress!)
         }
         guard status == noErr else { return [] }
-        return ids
+        return Array(ids.prefix(Int(dataSize) / MemoryLayout<AudioDeviceID>.size))
     }
 
     static func allOutputDevices() -> [AudioOutputDevice] {
         var result: [AudioOutputDevice] = []
         for id in allDeviceIDs() {
-            guard hasOutputChannels(deviceID: id) else { continue }
-            let uid = stringProperty(deviceID: id, selector: kAudioDevicePropertyDeviceUID, scope: kAudioObjectPropertyScopeGlobal) ?? ""
+            guard hasOutputChannels(deviceID: id),
+                  uintProperty(id, selector: kAudioDevicePropertyDeviceIsAlive) == 1 else { continue }
+            let transport = uintProperty(id, selector: kAudioDevicePropertyTransportType)
+            // An aggregate or virtual output can contain our input and create a loop.
+            guard transport != nil, transport != kAudioDeviceTransportTypeVirtual,
+                  transport != kAudioDeviceTransportTypeAggregate,
+                  transport != kAudioDeviceTransportTypeAutoAggregate else { continue }
+            guard let uid = deviceUID(id), !uid.isEmpty else { continue }
             let name = stringProperty(deviceID: id, selector: kAudioObjectPropertyName, scope: kAudioObjectPropertyScopeGlobal) ?? "(unknown)"
             result.append(AudioOutputDevice(id: id, uid: uid, name: name))
         }
@@ -69,13 +75,16 @@ enum SystemAudio {
         let raw = UnsafeMutableRawPointer.allocate(byteCount: Int(dataSize), alignment: 16)
         defer { raw.deallocate() }
         guard AudioObjectGetPropertyData(deviceID, &addr, 0, nil, &dataSize, raw) == noErr else { return false }
+        let header = MemoryLayout<AudioBufferList>.offset(of: \.mBuffers)!
+        guard Int(dataSize) >= header else { return false }
         let bufferList = raw.assumingMemoryBound(to: AudioBufferList.self)
+        guard Int(bufferList.pointee.mNumberBuffers) <= (Int(dataSize) - header) / MemoryLayout<AudioBuffer>.stride else { return false }
         let abl = UnsafeMutableAudioBufferListPointer(bufferList)
         var totalChannels = 0
         for i in 0..<abl.count {
             totalChannels += Int(abl[i].mNumberChannels)
         }
-        return totalChannels > 0
+        return totalChannels >= 2
     }
 
     private static func stringProperty(deviceID: AudioDeviceID, selector: AudioObjectPropertySelector, scope: AudioObjectPropertyScope) -> String? {
@@ -111,6 +120,12 @@ enum SystemAudio {
         return macStereoFixDeviceID() != nil
     }
 
+    static func macStereoFixDriverVersion() -> String? {
+        guard let device = macStereoFixDeviceID() else { return nil }
+        return stringProperty(deviceID: device, selector: kAudioObjectPropertyFirmwareVersion,
+                              scope: kAudioObjectPropertyScopeGlobal)
+    }
+
     // MARK: - Default output device
 
     static func defaultOutputDevice() -> AudioDeviceID {
@@ -139,78 +154,44 @@ enum SystemAudio {
         return status == noErr
     }
 
-    // MARK: - Per-device output volume
-
-    /// Read the current output volume (0...1) for a device. Tries the main
-    /// element first; falls back to averaging channels 1 and 2 for devices
-    /// that only support per-channel volume. Matches `setDeviceVolume`, which
-    /// writes both channels in the same fallback path — reading only ch1
-    /// while writing both would make the slider disagree with reality on
-    /// devices where L/R volumes have drifted apart.
-    /// Returns nil if the device exposes no volume control.
-    static func deviceVolume(_ deviceID: AudioDeviceID) -> Float? {
-        var addr = AudioObjectPropertyAddress(
-            mSelector: kAudioDevicePropertyVolumeScalar,
-            mScope: kAudioObjectPropertyScopeOutput,
-            mElement: kAudioObjectPropertyElementMain
-        )
-        if AudioObjectHasProperty(deviceID, &addr) {
-            var vol: Float32 = 0
-            var size = UInt32(MemoryLayout<Float32>.size)
-            if AudioObjectGetPropertyData(deviceID, &addr, 0, nil, &size, &vol) == noErr {
-                return vol
-            }
-        }
-        var sum: Float = 0
-        var count: Int = 0
-        for ch: AudioObjectPropertyElement in [1, 2] {
-            addr.mElement = ch
-            if AudioObjectHasProperty(deviceID, &addr) {
-                var vol: Float32 = 0
-                var size = UInt32(MemoryLayout<Float32>.size)
-                if AudioObjectGetPropertyData(deviceID, &addr, 0, nil, &size, &vol) == noErr {
-                    sum += vol
-                    count += 1
-                }
-            }
-        }
-        return count > 0 ? sum / Float(count) : nil
+    static func deviceUID(_ id: AudioDeviceID) -> String? {
+        stringProperty(deviceID: id, selector: kAudioDevicePropertyDeviceUID, scope: kAudioObjectPropertyScopeGlobal)
     }
 
-    /// Set the output volume (0...1) on a device. Tries the main element
-    /// first; falls back to all output channels for devices that only support
-    /// per-channel volume. Returns true if at least one element was updated.
+    static func sampleRate(_ id: AudioDeviceID) -> Float64? {
+        var value: Float64 = 0
+        var size = UInt32(MemoryLayout<Float64>.size)
+        var address = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyNominalSampleRate,
+            mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+        guard AudioObjectGetPropertyData(id, &address, 0, nil, &size, &value) == noErr,
+              value.isFinite else { return nil }
+        return value
+    }
+
+    private static func uintProperty(_ id: AudioObjectID, selector: AudioObjectPropertySelector) -> UInt32? {
+        var value: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        var address = AudioObjectPropertyAddress(mSelector: selector,
+            mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+        return AudioObjectGetPropertyData(id, &address, 0, nil, &size, &value) == noErr ? value : nil
+    }
+
+    /// Restore only the default owned by this app; preserve changes made in Sound settings.
     @discardableResult
-    static func setDeviceVolume(_ deviceID: AudioDeviceID, _ value: Float) -> Bool {
-        var v: Float32 = max(0, min(1, value))
-        var addr = AudioObjectPropertyAddress(
-            mSelector: kAudioDevicePropertyVolumeScalar,
-            mScope: kAudioObjectPropertyScopeOutput,
-            mElement: kAudioObjectPropertyElementMain
-        )
-        if AudioObjectHasProperty(deviceID, &addr) {
-            var settable: DarwinBoolean = false
-            if AudioObjectIsPropertySettable(deviceID, &addr, &settable) == noErr, settable.boolValue {
-                if AudioObjectSetPropertyData(deviceID, &addr, 0, nil,
-                                              UInt32(MemoryLayout<Float32>.size), &v) == noErr {
-                    return true
-                }
-            }
+    static func restoreOutput(preferredUID: String?) -> Bool {
+        let current = defaultOutputDevice()
+        guard current != 0, let currentUID = deviceUID(current) else { return false }
+        guard currentUID == macStereoFixUID else { return true }
+        let outputs = allOutputDevices()
+        let preferred = outputs.first { $0.uid == preferredUID }
+        let systemID = uintProperty(AudioObjectID(kAudioObjectSystemObject), selector: kAudioHardwarePropertyDefaultSystemOutputDevice)
+        let system = outputs.first { $0.id == systemID }
+        var candidates = [preferred, system].compactMap { $0 }
+        candidates += outputs.filter { !candidates.contains($0) }
+        for device in candidates {
+            if setDefaultOutputDevice(device.id), defaultOutputDevice() == device.id { return true }
         }
-        var anySuccess = false
-        for ch: AudioObjectPropertyElement in [1, 2] {
-            addr.mElement = ch
-            if AudioObjectHasProperty(deviceID, &addr) {
-                var settable: DarwinBoolean = false
-                if AudioObjectIsPropertySettable(deviceID, &addr, &settable) == noErr, settable.boolValue {
-                    if AudioObjectSetPropertyData(deviceID, &addr, 0, nil,
-                                                  UInt32(MemoryLayout<Float32>.size), &v) == noErr {
-                        anySuccess = true
-                    }
-                }
-            }
-        }
-        return anySuccess
+        return false
     }
 
     // MARK: - Volume control bridge
@@ -218,7 +199,7 @@ enum SystemAudio {
     /// Find the output-scope volume control owned by a device, if any.
     /// MacStereoFix exposes one so the helper app can observe hardware
     /// volume-key presses and mirror them to the real output device.
-    static func outputVolumeControlID(for deviceID: AudioDeviceID) -> AudioObjectID? {
+    static func outputControlID(for deviceID: AudioDeviceID, class expectedClass: AudioClassID) -> AudioObjectID? {
         var listAddr = AudioObjectPropertyAddress(
             mSelector: kAudioObjectPropertyControlList,
             mScope: kAudioObjectPropertyScopeGlobal,
@@ -234,6 +215,7 @@ enum SystemAudio {
             AudioObjectGetPropertyData(deviceID, &listAddr, 0, nil, &size, buf.baseAddress!)
         }
         guard status == noErr else { return nil }
+        controls = Array(controls.prefix(Int(size) / MemoryLayout<AudioObjectID>.size))
 
         var classAddr = AudioObjectPropertyAddress(
             mSelector: kAudioObjectPropertyClass,
@@ -249,7 +231,7 @@ enum SystemAudio {
             var classID: AudioClassID = 0
             var classSize = UInt32(MemoryLayout<AudioClassID>.size)
             guard AudioObjectGetPropertyData(controlID, &classAddr, 0, nil, &classSize, &classID) == noErr else { continue }
-            if classID != kAudioVolumeControlClassID { continue }
+            if classID != expectedClass { continue }
             var scope: AudioObjectPropertyScope = 0
             var scopeSize = UInt32(MemoryLayout<AudioObjectPropertyScope>.size)
             guard AudioObjectGetPropertyData(controlID, &scopeAddr, 0, nil, &scopeSize, &scope) == noErr else { continue }
@@ -270,7 +252,7 @@ enum SystemAudio {
         var v: Float32 = 0
         var size = UInt32(MemoryLayout<Float32>.size)
         if AudioObjectGetPropertyData(controlID, &addr, 0, nil, &size, &v) == noErr {
-            return v
+            return v.isFinite ? min(max(v, 0), 1) : nil
         }
         return nil
     }
@@ -278,6 +260,7 @@ enum SystemAudio {
     /// Write the 0...1 scalar value of a level/volume control object.
     @discardableResult
     static func setControlScalarValue(_ controlID: AudioObjectID, _ value: Float) -> Bool {
+        guard value.isFinite else { return false }
         var v: Float32 = max(0, min(1, value))
         var addr = AudioObjectPropertyAddress(
             mSelector: kAudioLevelControlPropertyScalarValue,
@@ -288,38 +271,16 @@ enum SystemAudio {
                                           UInt32(MemoryLayout<Float32>.size), &v) == noErr
     }
 
-    /// Install a listener on a volume control's scalar-value property.
-    /// Returns the block that must be retained by the caller and passed
-    /// back to `removeControlScalarListener` for clean removal.
-    static func installControlScalarListener(
-        on controlID: AudioObjectID,
-        queue: DispatchQueue,
-        handler: @escaping () -> Void
-    ) -> AudioObjectPropertyListenerBlock? {
-        var addr = AudioObjectPropertyAddress(
-            mSelector: kAudioLevelControlPropertyScalarValue,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain
-        )
-        let block: AudioObjectPropertyListenerBlock = { _, _ in
-            handler()
-        }
-        let status = AudioObjectAddPropertyListenerBlock(controlID, &addr, queue, block)
-        return status == noErr ? block : nil
+    static func controlMuted(_ controlID: AudioObjectID) -> Bool? {
+        uintProperty(controlID, selector: kAudioBooleanControlPropertyValue).map { $0 != 0 }
     }
 
-    /// Remove a previously-installed scalar-value listener. Must be called
-    /// with the exact same control ID, queue, and block used to install it.
-    static func removeControlScalarListener(
-        on controlID: AudioObjectID,
-        queue: DispatchQueue,
-        block: @escaping AudioObjectPropertyListenerBlock
-    ) {
-        var addr = AudioObjectPropertyAddress(
-            mSelector: kAudioLevelControlPropertyScalarValue,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain
-        )
-        _ = AudioObjectRemovePropertyListenerBlock(controlID, &addr, queue, block)
+    @discardableResult
+    static func setControlMuted(_ controlID: AudioObjectID, _ muted: Bool) -> Bool {
+        var value: UInt32 = muted ? 1 : 0
+        var address = AudioObjectPropertyAddress(mSelector: kAudioBooleanControlPropertyValue,
+            mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+        return AudioObjectSetPropertyData(controlID, &address, 0, nil,
+            UInt32(MemoryLayout<UInt32>.size), &value) == noErr
     }
 }

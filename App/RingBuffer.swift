@@ -26,6 +26,7 @@ final class RingBuffer {
     // MARK: - Init / deinit
 
     init(frames: Int, channels: Int) {
+        precondition(frames >= 2 && frames <= 1 << 20 && channels > 0 && channels <= 64)
         // Round up to power of two for cheap modulo via bitmask. Not strictly
         // required, but helps consistency with the driver's ring size.
         var p = 1
@@ -83,6 +84,7 @@ final class RingBuffer {
     /// Caller is the single producer.
     @discardableResult
     func write(_ src: UnsafePointer<Float>, frameCount: Int) -> Int {
+        guard frameCount > 0 else { return 0 }
         let w = msf_atomic_load(writePtr)
         let r = msf_atomic_load(readPtr)
         let free = capacityFrames - 1 - Int(w &- r)
@@ -110,6 +112,7 @@ final class RingBuffer {
     /// Caller is the single consumer.
     @discardableResult
     func read(_ dst: UnsafeMutablePointer<Float>, frameCount: Int) -> Int {
+        guard frameCount > 0 else { return 0 }
         let w = msf_atomic_load(writePtr)
         let r = msf_atomic_load(readPtr)
         let avail = Int(w &- r)

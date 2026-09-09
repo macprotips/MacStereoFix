@@ -1,93 +1,69 @@
-// DriverManager.swift
-//
-// Checks whether the MacStereoFix.driver bundle is installed in the system
-// HAL plug-in directory, and provides an installer that copies the bundled
-// driver in via an authenticated AppleScript "do shell script with
-// administrator privileges" call. Reloads coreaudiod after install so the
-// device shows up immediately.
-
 import Foundation
 
 enum DriverManager {
-
-    // MARK: - Paths
-
     static let driverInstallPath = "/Library/Audio/Plug-Ins/HAL/MacStereoFix.driver"
+    // Pin privileged installation to this project's Developer ID, not any signed bundle.
+    static let signingRequirement = #"identifier "com.macstereofix.driver" and anchor apple generic and certificate leaf[subject.OU] = "MD83L42DNL" and certificate leaf[field.1.2.840.113635.100.6.1.13] exists"#
 
-    // MARK: - Status
-
-    /// True if the driver bundle exists on disk AND the device is registered.
     static func isInstalled() -> Bool {
-        return FileManager.default.fileExists(atPath: driverInstallPath)
-            && SystemAudio.isInstalled()
+        guard let bundled = bundledDriverPath(),
+              let expected = version(at: bundled), expected == version(at: driverInstallPath) else { return false }
+        return SystemAudio.macStereoFixDriverVersion() == expected
     }
 
-    /// Returns the path to the bundled driver inside our app's Resources, or
-    /// nil if it's missing (which should never happen in a properly built app).
+    private static func version(at path: String) -> String? {
+        // Read the plist directly: Bundle caches metadata across reinstalls.
+        let url = URL(fileURLWithPath: path).appendingPathComponent("Contents/Info.plist")
+        guard let data = try? Data(contentsOf: url),
+              let plist = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any] else { return nil }
+        return plist["CFBundleVersion"] as? String
+    }
+
     private static func bundledDriverPath() -> String? {
-        guard let resPath = Bundle.main.resourcePath else { return nil }
-        let candidate = (resPath as NSString).appendingPathComponent("MacStereoFix.driver")
-        return FileManager.default.fileExists(atPath: candidate) ? candidate : nil
+        Bundle.main.resourceURL?.appendingPathComponent("MacStereoFix.driver").path
     }
 
-    // MARK: - Install / uninstall
-
-    /// Install (or reinstall) the driver. Prompts the user for an admin
-    /// password via the standard macOS authentication dialog. Returns nil on
-    /// success or an error message on failure.
     static func installDriver() -> String? {
-        guard let src = bundledDriverPath() else {
-            return "Bundled driver not found inside MacStereoFix.app/Contents/Resources."
-        }
-        let escapedSrc = shellEscape(src)
-        let escapedDst = shellEscape(driverInstallPath)
-        let shell = """
-        mkdir -p '/Library/Audio/Plug-Ins/HAL' && \
-        rm -rf '\(escapedDst)' && \
-        cp -R '\(escapedSrc)' '\(escapedDst)' && \
-        xattr -dr com.apple.quarantine '\(escapedDst)' 2>/dev/null; \
-        chown -R root:wheel '\(escapedDst)' && \
-        killall coreaudiod 2>/dev/null || true
-        """
-        return runPrivileged(shell: shell, failureLabel: "Install failed.")
+        guard let source = bundledDriverPath() else { return "Bundled driver not found." }
+        // Generated Swift constants are sealed in the app's signed executable.
+        let shell = "set -- \(shellQuote(source)) \(shellQuote(signingRequirement))\n" + InstallerScripts.install
+        return runPrivileged(shell: shell, failureLabel: "Installation failed.")
     }
 
-    /// Uninstall the driver. Same admin prompt flow.
     static func uninstallDriver() -> String? {
-        let escapedDst = shellEscape(driverInstallPath)
-        let shell = """
-        rm -rf '\(escapedDst)' && (killall coreaudiod 2>/dev/null || true)
-        """
-        return runPrivileged(shell: shell, failureLabel: "Uninstall failed.")
+        runPrivileged(shell: InstallerScripts.uninstall, failureLabel: "Removal failed.")
     }
 
-    // MARK: - Privileged shell helper
+    static func shellQuote(_ value: String) -> String {
+        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
 
-    /// Wrap `shell` in a `do shell script ... with administrator privileges`
-    /// AppleScript and run it. Returns nil on success or an error message.
-    private static func runPrivileged(shell: String, failureLabel: String) -> String? {
-        // Escape the shell string for embedding inside a double-quoted
-        // AppleScript literal: backslashes first, then double quotes.
-        let escaped = shell
-            .replacingOccurrences(of: "\\", with: "\\\\")
+    static func appleScript(shell: String) -> String {
+        // A fixed shell and a single quoted script argument prevent any path
+        // (including spaces, quotes and newlines) from becoming executable code.
+        let command = "/bin/bash -c " + shellQuote(shell)
+        let escaped = command.replacingOccurrences(of: "\\", with: "\\\\")
             .replacingOccurrences(of: "\"", with: "\\\"")
-        let appleScript = """
-        do shell script "\(escaped)" with administrator privileges
-        """
-        guard let scriptObj = NSAppleScript(source: appleScript) else {
-            return "Could not create AppleScript."
-        }
-        var errorDict: NSDictionary?
-        _ = scriptObj.executeAndReturnError(&errorDict)
-        if let err = errorDict {
-            return (err["NSAppleScriptErrorMessage"] as? String) ?? failureLabel
-        }
-        return nil
+            .replacingOccurrences(of: "\n", with: "\\n")
+            .replacingOccurrences(of: "\r", with: "\\r")
+        return "do shell script \"\(escaped)\" with administrator privileges"
     }
 
-    /// Single-quote-escape a path so it's safe to embed inside a `'...'` shell
-    /// literal (closes the quote, inserts an escaped quote, reopens).
-    private static func shellEscape(_ s: String) -> String {
-        return s.replacingOccurrences(of: "'", with: "'\\''")
+    private static func runPrivileged(shell: String, failureLabel: String) -> String? {
+        let process = Process()
+        let errorPipe = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        process.arguments = ["-e", appleScript(shell: shell)]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = errorPipe
+        do {
+            try process.run()
+            // Drain before waiting so a large error cannot fill the pipe and deadlock.
+            let data = errorPipe.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
+            guard process.terminationStatus != 0 else { return nil }
+            let message = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            return message.flatMap { $0.isEmpty ? nil : $0 } ?? failureLabel
+        } catch { return "\(failureLabel) \(error.localizedDescription)" }
     }
 }

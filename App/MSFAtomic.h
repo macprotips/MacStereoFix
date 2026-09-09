@@ -10,6 +10,9 @@
 #include <stdint.h>
 #include <string.h>
 
+_Static_assert(ATOMIC_LLONG_LOCK_FREE == 2 && ATOMIC_INT_LOCK_FREE == 2,
+               "Audio callbacks require lock-free atomics");
+
 // MARK: - MSFAtomicU64 (ring-buffer read/write indices)
 
 typedef struct {
@@ -17,7 +20,7 @@ typedef struct {
 } MSFAtomicU64;
 
 static inline void msf_atomic_init(MSFAtomicU64 *a, uint64_t v) {
-    atomic_store_explicit(&a->value, v, memory_order_relaxed);
+    atomic_init(&a->value, v);
 }
 
 static inline void msf_atomic_store(MSFAtomicU64 *a, uint64_t v) {
@@ -40,7 +43,7 @@ typedef struct {
 static inline void msf_atomic_float_init(MSFAtomicFloat *a, float v) {
     uint32_t b;
     memcpy(&b, &v, sizeof(b));
-    atomic_store_explicit(&a->bits, b, memory_order_relaxed);
+    atomic_init(&a->bits, b);
 }
 
 static inline void msf_atomic_float_store(MSFAtomicFloat *a, float v) {

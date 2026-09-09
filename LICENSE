@@ -1,0 +1,4 @@
+For personal use among friends.
+
+The audio driver is based on Apple's NullAudio sample. The Apple sample notice
+is included in ThirdParty/Apple-NullAudio-LICENSE.txt and applies to that code.
