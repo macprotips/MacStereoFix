@@ -66,8 +66,14 @@ installed SDK and Apple's [driver sample](https://developer.apple.com/documentat
   owner closure and SIGKILL, with a fake output setter.
 - Release-gate rejection tests, metadata/version/entitlement checks, shell/plist
   validation and Clang static analysis pass.
-- Light and dark menu views were rendered offscreen and inspected. Interactive
-  keyboard/VoiceOver testing is still required.
+- Redesigned menu views were rendered offscreen in light and dark appearances
+  for setup, Off, On, muted, no output, permission denial, busy and long device-name
+  states, with test doubles for audio operations. The view uses native labeled
+  controls, explicit status text, readable accent colors, a bounded scroll area,
+  recovery links, and Command-R / Command-Q shortcuts. Original speaker artwork
+  supplies all Finder icon sizes; it uses AppKit drawing without external assets.
+  Interactive keyboard and
+  VoiceOver testing is still required.
 - Read-only live enumeration found this Mac's built-in stereo output at 48 kHz;
   its current output UID was readable. No MacStereoFix driver was loaded.
 - A search across the repository's existing history found no matches for the

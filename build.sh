@@ -79,6 +79,7 @@ mkdir -p "$APP_BUNDLE/Contents/MacOS"
 mkdir -p "$APP_BUNDLE/Contents/Resources"
 
 cp "$APP_SRC_DIR/Info.plist" "$APP_BUNDLE/Contents/Info.plist"
+cp "$APP_SRC_DIR/AppIcon.icns" "$APP_BUNDLE/Contents/Resources/"
 cp "$APP_SRC_DIR/PrivacyInfo.xcprivacy" "$APP_BUNDLE/Contents/Resources/"
 cp -R "$ROOT_DIR/ThirdParty" "$APP_BUNDLE/Contents/Resources/"
 

@@ -9,6 +9,15 @@ when a game sends surround audio but you listen through stereo speakers or headp
 contain the safety and recovery changes on this branch. A new release must pass
 [the release checklist](docs/RELEASE_CHECKLIST.md) before distribution.
 
+## Interface preview
+
+<table><tr>
+<td><img src="docs/images/stereo-light.png" width="360" alt="MacStereoFix in light appearance"></td>
+<td><img src="docs/images/stereo-dark.png" width="360" alt="MacStereoFix in dark appearance"></td>
+</tr></table>
+
+Rendered from the candidate interface with a sample output; hardware testing is pending.
+
 ## What it does
 
 The app installs a user-space CoreAudio HAL plug-in, not a kernel extension.
@@ -41,7 +50,7 @@ cause audible distortion in loud scenes; begin at a low listening volume.
 1. Download a signed and notarized release from this repository, unzip it, and
    move `MacStereoFix.app` to Applications.
 2. Open it and use the speaker icon in the menu bar.
-3. Finish calls and recordings, then click **Install Driver**. macOS asks for an
+3. Finish calls and recordings, then click **Install Audio Driver…**. macOS asks for an
    administrator password. Installing, updating, or removing the driver briefly
    interrupts **all Mac audio** while CoreAudio restarts.
 4. Select your speakers or headphones and turn **Force Stereo** on.
@@ -70,7 +79,7 @@ only after the intended output is available.
 
 ## Remove it
 
-Use **Advanced → Uninstall Driver**, then move the app from Applications to the
+Use **Driver & help → Uninstall…**, then move the app from Applications to the
 Trash. The app stops routing first. Removal needs administrator authorization
 and briefly interrupts Mac audio.
 
