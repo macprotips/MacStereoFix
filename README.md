@@ -1,186 +1,136 @@
 # MacStereoFix
 
-A small Mac utility that **forces every app's audio through a stereo downmix**, with a **dialogue boost** so center-channel voices stop getting lost. Built specifically to fix the "voices are super faint in this game" problem in CrossOver bottles, but it works for *any* macOS audio source — games, players, browsers — because it sits at the system audio layer.
+MacStereoFix is a macOS menu bar utility that downmixes surround audio to stereo,
+including the center channel that carries dialogue in many games. It is useful
+when a game sends surround audio but you listen through stereo speakers or headphones.
 
-It works by installing a small CoreAudio virtual device called **MacStereoFix**, then routing all audio through that device, downmixing 7.1 / 5.1 to 2 channels in real time, and sending the result to the speaker / headphones / AirPods you pick.
+**Version 1.3.0 is an unreleased audit candidate.** The published
+[v1.2 download](https://github.com/macprotips/MacStereoFix/releases/tag/v1.2) does not
+contain the safety and recovery changes on this branch. A new release must pass
+[the release checklist](docs/RELEASE_CHECKLIST.md) before distribution.
 
-This is a personal-use project for a small group of friends. It is not a polished commercial app.
+## What it does
 
----
+The app installs a user-space CoreAudio HAL plug-in, not a kernel extension.
+When you turn **Force Stereo** on, it reads eight-channel, 48 kHz PCM from that
+virtual device, mixes it to stereo, and sends the result to your selected output.
+Apps that follow the macOS default output then use this route. Apps that select
+their own output, system alerts, and protected audio may behave differently.
 
-## Download
+Supported destinations have at least two output channels at 32–192 kHz.
+Apple's audio converter handles output sample-rate conversion and small clock
+differences. Virtual and aggregate destinations are excluded to avoid feedback.
+Bluetooth call modes with only one output channel are not supported.
 
-Prebuilt signed + notarized app:
-**[MacStereoFix v1.2](https://github.com/macprotips/MacStereoFix/releases/latest)**
+- **Dialogue boost:** 0–9 dB above the base center coefficient; default +3 dB.
+- **Volume and mute:** attenuate routed audio without changing hardware volume
+  or left/right balance. Turning Off returns to the device's normal volume.
+- **Off and Quit:** attempt to restore the previous output, with a connected
+  physical fallback if it disappeared. A small child process also attempts this
+  if the app crashes or is force-quit. It exits afterward and has no login item.
+- **Sleep, device loss, routing errors, and manual output changes:** stop routing.
+  The app starts off at each launch and does not automatically resume capture.
 
-Unzip, drag `MacStereoFix.app` into `/Applications`, launch it, and click **Install Driver** in the menu bar popover. That's it.
+The mix is `L + Cgain*C + 0.707*Ls + 0.5*Lsr` and the corresponding right channels.
+`Cgain = 0.707 * 10^(boost/20)`. LFE is omitted. Invalid samples are silenced and
+mix peaks are clipped before software attenuation. More dialogue boost can
+cause audible distortion in loud scenes; begin at a low listening volume.
 
----
+## Install a verified release
 
-## What's in here
+1. Download a signed and notarized release from this repository, unzip it, and
+   move `MacStereoFix.app` to Applications.
+2. Open it and use the speaker icon in the menu bar.
+3. Finish calls and recordings, then click **Install Driver**. macOS asks for an
+   administrator password. Installing, updating, or removing the driver briefly
+   interrupts **all Mac audio** while CoreAudio restarts.
+4. Select your speakers or headphones and turn **Force Stereo** on.
+5. Allow the macOS microphone permission prompt. The app reads the virtual
+   device, not your physical microphone. Permission denial leaves normal output
+   in place. See [privacy details](PRIVACY.md).
 
-```
-MacStereoFix/
-├── Driver/                      # Audio server plug-in (C)
-│   ├── MacStereoFixDriver.c     # The HAL plug-in implementation
-│   └── Info.plist               # Driver bundle metadata
-├── App/                         # Menu bar app (Swift)
-│   ├── MacStereoFixApp.swift    # @main entry / MenuBarExtra
-│   ├── AppState.swift           # Toggle state, persisted prefs, observers
-│   ├── MenuBarView.swift        # SwiftUI menu UI
-│   ├── AudioRouter.swift        # Two HALOutput AUs + downmix DSP
-│   ├── RingBuffer.swift         # SPSC lock-free Float ring buffer
-│   ├── SystemAudio.swift        # Device enumeration & default-output control
-│   ├── DriverManager.swift      # Install/uninstall via authenticated AppleScript
-│   ├── MSFAtomic.h              # C atomic helpers (imported via bridging header)
-│   └── Info.plist               # App bundle metadata
-├── build.sh                     # Builds driver + app into ./build/
-├── install.sh                   # sudo install of the driver
-├── uninstall.sh                 # sudo remove of the driver
-└── README.md                    # this file
-```
+The app verifies the staged driver's signature and developer identity before
+replacing an existing installation. It also checks that the current driver
+version is actually loaded, not merely copied onto disk.
 
----
+If macOS reports an unidentified developer, damage, or an unverifiable app,
+stop and download a verified release. Do not disable Gatekeeper, SIP, or other
+macOS protections to install MacStereoFix.
 
-## How it works (the short version)
+## If sound stops
 
-1. The **driver** is a CoreAudio audio server plug-in that exposes one virtual device, `MacStereoFix`, with one 8-channel input stream and one 8-channel output stream. Internally it's just a circular buffer: whatever an app writes to the output stream becomes available on the input stream a moment later. The driver does **no DSP**.
+Open **System Settings → Sound → Output** and select your normal speakers or
+headphones. This bypasses MacStereoFix immediately. Do not select MacStereoFix
+manually while its app is off.
 
-2. The **menu bar app** owns two `kAudioUnitSubType_HALOutput` audio units:
-   - The **capture unit** is bound to MacStereoFix and pulls 8-channel Float32 audio out of it via an input callback.
-   - The **render unit** is bound to your chosen real output device (MacBook speakers, AirPods, monitor, etc.). Its render callback reads 8-channel frames from the ring buffer, **downmixes them to stereo with the current dialogue boost**, and sends them to the device.
+If the app cannot start capture, check **Privacy & Security → Microphone**.
+If an updated driver does not load, restart the Mac. For a Bluetooth device in
+call mode, end the call or select another stereo output. Re-enable Force Stereo
+only after the intended output is available.
 
-3. When you toggle **Force Stereo: ON**, the app:
-   - starts both audio units
-   - sets the system default output device to MacStereoFix
-   so that every app on your Mac (including CrossOver bottles, since Wine respects the macOS default output) sends its audio into our pipeline.
+## Remove it
 
-4. When you toggle **OFF**, the app stops the audio units and restores the previous default output device.
+Use **Advanced → Uninstall Driver**, then move the app from Applications to the
+Trash. The app stops routing first. Removal needs administrator authorization
+and briefly interrupts Mac audio.
 
-The downmix uses the standard ITU coefficients with an adjustable boost on the center channel:
+Developers can select a normal output, quit the app, then run `sudo ./uninstall.sh`.
+The script removes only `/Library/Audio/Plug-Ins/HAL/MacStereoFix.driver` and
+restarts CoreAudio. Preferences can optionally be removed with
+`defaults delete com.macstereofix.app`.
 
-```
-Lo = L + Cgain·C + 0.707·Ls + 0.5·Lsr
-Ro = R + Cgain·C + 0.707·Rs + 0.5·Rsr
-```
+## Build and verify
 
-`Cgain` defaults to 0.707 (-3 dB) and goes up to roughly 2.0 (+6 dB) at the top of the **Dialogue boost** slider. LFE is dropped.
-
----
-
-## Building
-
-You need:
-
-- macOS 13+ (the app uses SwiftUI's `MenuBarExtra`)
-- Xcode Command Line Tools (`xcode-select --install`) — gives you `clang`, `swiftc`, `codesign`, `lipo`
-- A few seconds
-
-```sh
-./build.sh
-```
-
-This produces:
-
-```
-build/MacStereoFix.driver       # the audio server plug-in bundle
-build/MacStereoFix.app          # the menu bar app, with the driver bundled inside
-```
-
-Both bundles are universal (arm64 + x86_64) and ad-hoc signed.
-
----
-
-## Installing
-
-You have two options:
-
-### Option A — let the app install the driver for you (recommended)
-
-1. Drag `build/MacStereoFix.app` into `/Applications`.
-2. Launch it. It'll appear in your menu bar as a small speaker icon.
-3. Click the icon. Because the driver isn't installed yet, you'll see an **Install Driver** button. Click it.
-4. macOS will prompt for your administrator password (this is the standard "do shell script with administrator privileges" dialog). After you authorize it, the app:
-   - copies `MacStereoFix.driver` from `Contents/Resources/` into `/Library/Audio/Plug-Ins/HAL/`
-   - chowns it to `root:wheel`
-   - kicks `coreaudiod` so the device shows up immediately
-5. Click the icon again — the toggle and device picker now appear.
-
-### Option B — install from the command line
+Requires macOS, Xcode 15 or newer (or matching Command Line Tools), Swift 5.9+,
+and the system Python 3 supplied with those tools. The deployment target is
+macOS 13. Both Apple Silicon and Intel binaries are built. Actual OS/device
+coverage is tracked in the release checklist; cross-compiling alone is not proof
+of compatibility.
 
 ```sh
 ./build.sh
-sudo ./install.sh
-cp -R build/MacStereoFix.app /Applications/
+./check.sh
 ```
 
-Then launch the app from `/Applications`.
+Builds go into `build/`. With no signing identity, these are **local development
+builds only**. The in-app installer intentionally rejects ad-hoc drivers.
+Developers who trust their own checkout may explicitly use
+`sudo ./install.sh --allow-adhoc` for local testing; this is not a distribution path.
 
----
+The automated checks do not install a driver, capture audio, change output
+settings, or kill CoreAudio. They exercise the driver under AddressSanitizer,
+UndefinedBehaviorSanitizer and ThreadSanitizer; the production mixer/converter;
+routing failures; installer rollback and quoting; and crash recovery with test
+doubles. GitHub Actions runs them on Apple Silicon and Intel.
 
-## Using it
+## Produce a release
 
-1. Click the menu bar icon.
-2. Pick your real output device under **Send stereo to** (your speakers, AirPods, etc.).
-3. Flip **Force Stereo** to **ON**.
-4. Play your game / movie / whatever. All audio now flows: app → MacStereoFix → MacStereoFix.app → real output, downmixed to stereo.
-5. Flip **OFF** when you're done. The app restores your previous default output device.
-
-The first time you toggle ON, macOS will show a **microphone access** prompt. This is because the helper app is technically reading from MacStereoFix's input stream, which macOS classifies as audio input. Allow it. (No actual microphone is involved.)
-
-### CrossOver-specific notes
-
-No need to edit the registry of a bottle in CrossOver or install complicated audio applications. With MacStereoFix ON, anything playing inside a bottle automatically goes through the downmix.
-
----
-
-## Uninstalling
-
-From the app: **Advanced → Uninstall Driver**. You'll get the same admin prompt.
-
-Or from the command line:
+Complete [docs/RELEASE_CHECKLIST.md](docs/RELEASE_CHECKLIST.md) on the exact source
+commit. Use your Developer ID Application certificate and an existing
+`notarytool` Keychain profile. Do not put passwords or private keys in the repository.
 
 ```sh
-sudo ./uninstall.sh
-rm -rf /Applications/MacStereoFix.app
+SIGN_IDENTITY='Developer ID Application: Your Name (TEAMID)' \
+NOTARY_PROFILE='your-saved-profile' \
+RELEASE_TESTED_COMMIT='the-full-tested-commit-sha' \
+./release.sh
 ```
 
----
+The project pins installation to its current developer team, `MD83L42DNL`.
+Changing that identity is an explicit trust change, not just a build setting.
 
-## Troubleshooting
+The release script requires a clean checkout, builds and runs the checks, verifies
+signatures, waits for Apple's acceptance, staples the ticket, checks Gatekeeper,
+and verifies the extracted final ZIP. Only then does it emit a versioned archive
+and SHA-256 checksum. It does not publish anything to GitHub.
 
-**The MacStereoFix device doesn't appear in System Settings → Sound after install.**
-1. Check the driver bundle exists: `ls /Library/Audio/Plug-Ins/HAL/MacStereoFix.driver`
-2. Check ownership: `ls -ld /Library/Audio/Plug-Ins/HAL/MacStereoFix.driver` should show `root wheel`.
-3. Restart coreaudiod manually: `sudo launchctl kickstart -k system/com.apple.audio.coreaudiod`
-4. Look at the system log for plug-in load errors:
-   `log show --predicate 'subsystem == "com.apple.coreaudio"' --last 5m | grep -i macstereofix`
-5. If the driver is **unsigned** or **signed by an unknown identity**, modern macOS may silently refuse to load it. Rebuild with a real `SIGN_IDENTITY` and re-install.
+## Scope and licensing
 
-**The toggle turns on but I hear no sound.**
-- Check that your **Send stereo to** picker isn't pointing at MacStereoFix itself (it's filtered out, but if your selection is stale it could happen — use **Refresh Devices** in Advanced).
-- Open System Settings → Sound and confirm the system output is `MacStereoFix` while the toggle is on.
-- If macOS is asking for microphone permission, grant it — without that, the capture side is silent.
+No per-app routing, bitstream passthrough, Dolby/DTS decoding, HRTF, automatic
+updater, telemetry, or third-party runtime packages. macOS handles the input
+conversion from app formats to the virtual device's 48 kHz PCM stream.
 
-**I want to remove everything.**
-```sh
-sudo ./uninstall.sh
-rm -rf /Applications/MacStereoFix.app
-defaults delete com.macstereofix.app 2>/dev/null || true
-```
-
----
-
-## Things this v1 deliberately does NOT do
-
-- **No bitstream / passthrough.** PCM only. Dolby Digital and DTS streams are not handled. Almost every game and movie uses PCM through CoreAudio anyway.
-- **No per-app routing.** It's a system-wide toggle. If you want one app on stereo and another on surround, you'd need a much fancier app.
-- **No multiple sample rates.** The virtual device is locked to 48 kHz. macOS will sample-rate-convert for you when an app outputs 44.1 kHz.
-- **No surround panning, EQ, virtualization, or HRTF.** Just an honest downmix.
-- **No automatic launch at login.** Add it to System Settings → General → Login Items yourself if you want that.
-
----
-
-## License
-
-For personal use among friends. Driver structure is modeled on Apple's `NullAudio` sample (Apple Sample Code License). The rest is freshly written.
+The existing project policy is personal use among friends; this audit does not
+add a new open-source license or grant additional reuse rights. The driver is
+modeled on Apple's NullAudio sample. Its notice is preserved in
+[ThirdParty](ThirdParty/README.md) and included in the built app and driver.

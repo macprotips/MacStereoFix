@@ -26,19 +26,27 @@ struct MenuBarView: View {
                 toggleSection
                 Divider()
                 outputPickerSection
-                if state.outputVolumeAvailable {
-                    volumeSection
-                }
+                volumeSection
+                dialogueSection
                 Divider()
                 advancedSection
             }
             if let error = state.lastError {
                 Divider()
-                Text(error)
-                    .font(.caption)
-                    .foregroundStyle(.red)
-                    .fixedSize(horizontal: false, vertical: true)
+                ScrollView {
+                    Text(error)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                        .textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxHeight: 110)
             }
+            if let message = state.statusMessage {
+                Text(message).font(.caption).fixedSize(horizontal: false, vertical: true)
+            }
+            if state.isBusy { ProgressView().controlSize(.small).accessibilityLabel("Working") }
             Divider()
             footer
         }
@@ -61,9 +69,9 @@ struct MenuBarView: View {
 
     private var driverNotInstalledSection: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("Driver not installed")
+            Text("Driver installation required")
                 .font(.subheadline).bold()
-            Text("MacStereoFix needs to install a small audio driver. You'll be asked for your password once.")
+            Text("Install or update the audio driver. macOS will ask for an administrator password. All Mac audio will briefly stop while the driver loads; finish calls and recordings first.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -71,6 +79,7 @@ struct MenuBarView: View {
                 state.installDriver()
             }
             .buttonStyle(.borderedProminent)
+            .disabled(state.isBusy)
         }
     }
 
@@ -84,6 +93,7 @@ struct MenuBarView: View {
                     .font(.subheadline).bold()
             }
             .toggleStyle(.switch)
+            .disabled(state.isBusy || state.availableOutputs.isEmpty)
         }
     }
 
@@ -92,14 +102,10 @@ struct MenuBarView: View {
             Text("Send stereo to")
                 .font(.caption)
                 .foregroundStyle(.secondary)
-            Picker("", selection: Binding(
+            Picker("Send stereo to", selection: Binding(
                 get: { state.selectedOutputUID ?? "" },
                 set: { newUID in
-                    let uid = newUID.isEmpty ? nil : newUID
-                    state.selectedOutputUID = uid
-                    if state.isOn, let uid {
-                        state.switchOutputDeviceLive(to: uid)
-                    }
+                    state.selectOutput(newUID)
                 }
             )) {
                 ForEach(state.availableOutputs) { dev in
@@ -108,6 +114,11 @@ struct MenuBarView: View {
             }
             .labelsHidden()
             .pickerStyle(.menu)
+            .disabled(state.isBusy || state.availableOutputs.isEmpty)
+            if state.availableOutputs.isEmpty {
+                Text("Connect stereo speakers or headphones. Virtual and aggregate outputs aren't supported.")
+                    .font(.caption).fixedSize(horizontal: false, vertical: true)
+            }
         }
     }
 
@@ -126,13 +137,30 @@ struct MenuBarView: View {
                 Image(systemName: "speaker.fill")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
-                Slider(value: $state.outputVolume, in: 0...1)
+                Slider(value: $state.outputVolume, in: 0...1) { Text("Routing volume") }
+                    .labelsHidden()
                 Image(systemName: "speaker.wave.3.fill")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }
+            Text("Controls routed audio. Turning Off returns to your device's normal volume.")
+                .font(.caption2).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Toggle("Mute routed audio", isOn: $state.isMuted).font(.caption)
         }
         .padding(.top, 8)
+    }
+
+    private var dialogueSection: some View {
+        VStack(alignment: .leading) {
+            Text("Dialogue boost: +\(state.dialogueBoostDB, specifier: "%.0f") dB")
+                .font(.caption)
+            Slider(value: $state.dialogueBoostDB, in: 0...9, step: 1) { Text("Dialogue boost") }
+                .labelsHidden()
+            Text("Start with a low listening volume. More boost can distort loud scenes.")
+                .font(.caption2).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
     }
 
     private var advancedSection: some View {
@@ -143,6 +171,9 @@ struct MenuBarView: View {
                 Button("Refresh Devices") { state.refreshDevices() }
             }
             .padding(.top, 4)
+            .disabled(state.isBusy)
+            Text("Installing or removing the driver briefly interrupts all Mac audio.")
+                .font(.caption2).fixedSize(horizontal: false, vertical: true)
         }
         .font(.caption)
     }
@@ -159,6 +190,7 @@ struct MenuBarView: View {
             }
             .buttonStyle(.plain)
             .font(.caption)
+            .disabled(state.isBusy)
         }
     }
 }

@@ -1,406 +1,347 @@
-// AppState.swift
-//
-// Single source of truth for the menu bar UI. Owns the AudioRouter, the
-// device list, the toggle state, and the dialogue boost. Saves a tiny bit of
-// state to UserDefaults so the user's preferred output device sticks across
-// launches.
-
-import Foundation
-import CoreAudio
-import Combine
 import AppKit
+import AVFoundation
+import Combine
+import CoreAudio
+import Foundation
 
 @MainActor
 final class AppState: ObservableObject {
-
-    // MARK: - Published state
-
-    /// Master toggle: ON = audio is being routed through MacStereoFix.
-    @Published var isOn: Bool = false
-
-    /// Extra dB added on top of the -3 dB ITU center coefficient.
-    @Published var dialogueBoostDB: Float = 3.0 {
+    @Published private(set) var isOn = false
+    @Published private(set) var isBusy = false
+    @Published private(set) var driverInstalled = false
+    @Published private(set) var availableOutputs: [AudioOutputDevice] = []
+    @Published private(set) var lastError: String?
+    @Published private(set) var statusMessage: String?
+    @Published var selectedOutputUID: String? {
+        didSet { defaults.set(selectedOutputUID, forKey: "selectedOutputUID") }
+    }
+    @Published var dialogueBoostDB: Float = 3 {
         didSet {
             router.setDialogueBoostDB(dialogueBoostDB)
-            UserDefaults.standard.set(dialogueBoostDB, forKey: "dialogueBoostDB")
+            defaults.set(dialogueBoostDB, forKey: "dialogueBoostDB")
         }
     }
-
-    /// UID of the real output device stereo audio is sent to.
-    @Published var selectedOutputUID: String? {
+    /// Software attenuation; never changes hardware volume or channel balance.
+    @Published var outputVolume: Float = 1 {
         didSet {
-            if let uid = selectedOutputUID {
-                UserDefaults.standard.set(uid, forKey: "selectedOutputUID")
-            } else {
-                UserDefaults.standard.removeObject(forKey: "selectedOutputUID")
+            router.setOutputVolume(isMuted ? 0 : outputVolume)
+            defaults.set(outputVolume, forKey: "routingVolume")
+            if let control = virtualVolumeControlID, !updatingVolume {
+                SystemAudio.setControlScalarValue(control, outputVolume)
             }
-            // Picking a new device: sync the slider to that device's level.
-            refreshOutputVolumeFromDevice()
         }
     }
-
-    /// Volume of the currently selected real output device, 0...1.
-    /// Setting this propagates to the device immediately.
-    @Published var outputVolume: Float = 1.0 {
+    @Published var isMuted = false {
         didSet {
-            guard !suppressVolumeWriteback else { return }
-            guard let uid = selectedOutputUID,
-                  let dev = availableOutputs.first(where: { $0.uid == uid }) else { return }
-            SystemAudio.setDeviceVolume(dev.id, outputVolume)
-            // Mirror slider writes to the virtual device's volume control
-            // so the macOS volume HUD matches what the slider shows. When
-            // running, this also keeps the hardware-volume-key baseline in
-            // sync. The listener will fire but see no change and no-op.
-            if isOn, let ctl = virtualVolumeControlID {
-                SystemAudio.setControlScalarValue(ctl, outputVolume)
+            router.setOutputVolume(isMuted ? 0 : outputVolume)
+            if let control = virtualMuteControlID, !updatingVolume {
+                SystemAudio.setControlMuted(control, isMuted)
             }
         }
     }
 
-    /// True if the selected device exposes any volume control at all.
-    @Published private(set) var outputVolumeAvailable: Bool = false
-
-    /// List of real output devices (excludes MacStereoFix itself).
-    @Published private(set) var availableOutputs: [AudioOutputDevice] = []
-
-    /// True when the MacStereoFix driver bundle is installed and visible.
-    @Published private(set) var driverInstalled: Bool = false
-
-    /// Latest user-facing error message, or nil.
-    @Published private(set) var lastError: String?
-
-    // MARK: - Private state
-
+    private let defaults: UserDefaults
     private let router = AudioRouter()
-
-    /// Device the user was on before we hijacked the default — restored on Off.
-    private var previousDefaultDevice: AudioDeviceID = 0
-
-    /// True while we're updating outputVolume from a device read, so the
-    /// didSet observer doesn't write the same value back to Core Audio.
-    private var suppressVolumeWriteback = false
-
-    /// While running, the object ID of the MacStereoFix virtual device's
-    /// output volume control, or nil if the installed driver predates the
-    /// volume-control addition. Used to observe hardware volume-key presses.
+    private let recovery = AudioRecovery()
+    private var previousOutputUID: String?
+    private var routedDeviceID: AudioDeviceID?
+    private var generation = 0
+    private var observations: [AudioObservation] = []
+    private var notifications: [(NotificationCenter, NSObjectProtocol)] = []
+    private var healthTimer: Timer?
+    private var lastProgress: (capture: UInt64, render: UInt64) = (0, 0)
+    private var stalledChecks = 0
     private var virtualVolumeControlID: AudioObjectID?
+    private var volumeObservation: AudioObservation?
+    private var virtualMuteControlID: AudioObjectID?
+    private var muteObservation: AudioObservation?
+    private var updatingVolume = false
+    private var driverChangeInProgress = false
+    private let requestPermission: () async -> Bool
 
-    /// Listener block installed on `virtualVolumeControlID`. Held so it can
-    /// be removed cleanly on teardown — `AudioObjectRemovePropertyListenerBlock`
-    /// requires the same block reference used at registration.
-    private var virtualVolumeListenerBlock: AudioObjectPropertyListenerBlock?
-
-    // MARK: - Init
-
-    init() {
-        // Load persisted prefs
-        if let stored = UserDefaults.standard.object(forKey: "dialogueBoostDB") as? Double {
-            self.dialogueBoostDB = Float(stored)
+    init(defaults: UserDefaults = .standard,
+         requestPermission: @escaping () async -> Bool = AppState.requestAudioPermission) {
+        self.defaults = defaults
+        self.requestPermission = requestPermission
+        // Read the preference before device enumeration can select a fallback.
+        selectedOutputUID = defaults.string(forKey: "selectedOutputUID")
+        previousOutputUID = defaults.string(forKey: "recoveryOutputUID")
+        if let value = defaults.object(forKey: "dialogueBoostDB") as? NSNumber,
+           value.floatValue.isFinite {
+            dialogueBoostDB = min(max(value.floatValue, 0), 9)
         }
-        router.setDialogueBoostDB(self.dialogueBoostDB)
-
-        // Populate the device list first, then apply the stored selection.
-        // Doing this in the other order fires selectedOutputUID's didSet
-        // against an empty availableOutputs list.
+        if let value = defaults.object(forKey: "routingVolume") as? NSNumber,
+           value.floatValue.isFinite {
+            outputVolume = min(max(value.floatValue, 0), 1)
+        }
+        router.setDialogueBoostDB(dialogueBoostDB)
+        router.setOutputVolume(outputVolume)
         refreshDevices()
-        if let storedUID = UserDefaults.standard.string(forKey: "selectedOutputUID"),
-           availableOutputs.contains(where: { $0.uid == storedUID }) {
-            selectedOutputUID = storedUID
+        recoverOutput()
+        // Always start off. A crash, login, or permission prompt must not
+        // silently re-enable system-wide capture.
+        defaults.removeObject(forKey: "wasOn")
+
+        if let listener = AudioObservation(selector: kAudioHardwarePropertyDevices,
+            handler: { [weak self] in self?.refreshDevices() }) { observations.append(listener) }
+        if let listener = AudioObservation(selector: kAudioHardwarePropertyDefaultOutputDevice,
+            handler: { [weak self] in self?.defaultOutputChanged() }) { observations.append(listener) }
+        observe(.default, NSApplication.willTerminateNotification) { [weak self] in self?.turnOff() }
+        observe(NSWorkspace.shared.notificationCenter, NSWorkspace.willSleepNotification) { [weak self] in
+            guard let self else { return }
+            self.turnOff()
+            self.statusMessage = "Paused for sleep. Turn Force Stereo on when you're ready."
         }
-
-        installDeviceListListener()
-        installTerminationObserver()
-        recoverFromCrashedSession()
-
-        // Auto-resume: if the user had it on last time, turn it back on.
-        if UserDefaults.standard.bool(forKey: "wasOn") {
-            // Small delay so the menu bar UI has time to appear and the driver
-            // device is fully registered after a fresh login / reboot.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-                guard let self, !self.isOn, self.driverInstalled else { return }
-                self.turnOn()
-            }
+        observe(NSWorkspace.shared.notificationCenter, NSWorkspace.didWakeNotification) { [weak self] in
+            self?.refreshDevices()
         }
-    }
-
-    /// If a previous run crashed while toggled On, the system default output
-    /// may still be pointing at MacStereoFix with nothing reading from it.
-    /// Detect that and bounce the default to the user's chosen real device.
-    private func recoverFromCrashedSession() {
-        let current = SystemAudio.defaultOutputDevice()
-        guard let mac = SystemAudio.macStereoFixDeviceID(), current == mac else { return }
-        if let uid = selectedOutputUID,
-           let target = availableOutputs.first(where: { $0.uid == uid }) {
-            SystemAudio.setDefaultOutputDevice(target.id)
-        } else if let first = availableOutputs.first {
-            SystemAudio.setDefaultOutputDevice(first.id)
+        healthTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.checkAudioHealth() }
         }
     }
 
-    private func installTerminationObserver() {
-        NotificationCenter.default.addObserver(
-            forName: NSApplication.willTerminateNotification,
-            object: nil, queue: .main
-        ) { [weak self] _ in
-            // willTerminate has a very brief window before the app dies, so
-            // we must run synchronously. We're on the main queue already
-            // (queue: .main above), so it's safe to assume the main actor.
-            MainActor.assumeIsolated {
-                guard let self = self else { return }
-                if self.isOn { self.turnOff() }
-            }
-        }
+    deinit {
+        healthTimer?.invalidate()
+        for (center, token) in notifications { center.removeObserver(token) }
     }
 
-    // MARK: - Device list
+    private func observe(_ center: NotificationCenter, _ name: Notification.Name,
+                         handler: @escaping @MainActor () -> Void) {
+        let token = center.addObserver(forName: name, object: nil, queue: .main) { _ in
+            MainActor.assumeIsolated { handler() }
+        }
+        notifications.append((center, token))
+    }
 
     func refreshDevices() {
-        var devices = SystemAudio.allOutputDevices()
-        // Hide the MacStereoFix device itself from the picker.
-        devices.removeAll { $0.uid == SystemAudio.macStereoFixUID }
-        self.availableOutputs = devices
-        self.driverInstalled = DriverManager.isInstalled()
-
-        let selectedStillPresent = devices.contains(where: { $0.uid == selectedOutputUID })
-
-        // If no valid selection, pick a new default.
-        if !selectedStillPresent {
-            let currentDefault = SystemAudio.defaultOutputDevice()
-            if let match = devices.first(where: { $0.id == currentDefault }) {
-                selectedOutputUID = match.uid
-            } else if let first = devices.first {
-                selectedOutputUID = first.uid
-            }
+        let devices = SystemAudio.allOutputDevices()
+        availableOutputs = devices
+        driverInstalled = DriverManager.isInstalled()
+        let selected = devices.first { $0.uid == selectedOutputUID }
+        if isOn && (selected == nil || selected?.id != routedDeviceID || !driverInstalled) {
+            stopWithError("Audio device disconnected or restarted. Select your output and turn Force Stereo on again.")
         }
-
-        // Auto-failover: if we're running and the selected device just
-        // disconnected (e.g. AirPods taken off), switch to the new selection.
-        if isOn && !selectedStillPresent {
-            if let uid = selectedOutputUID {
-                switchOutputDeviceLive(to: uid)
-            } else {
-                // No devices left at all — turn off gracefully.
-                turnOff()
-                lastError = "Output device disconnected and no alternatives found."
-            }
+        if selected == nil {
+            selectedOutputUID = devices.first { $0.id == SystemAudio.defaultOutputDevice() }?.uid ?? devices.first?.uid
         }
-
-        refreshOutputVolumeFromDevice()
+        if !isOn && !isBusy { recoverOutput() }
     }
 
-    /// Pull the current volume off the selected device into the slider value.
-    private func refreshOutputVolumeFromDevice() {
-        guard let uid = selectedOutputUID,
-              let dev = availableOutputs.first(where: { $0.uid == uid }) else {
-            outputVolumeAvailable = false
-            return
-        }
-        if let v = SystemAudio.deviceVolume(dev.id) {
-            suppressVolumeWriteback = true
-            outputVolume = v
-            suppressVolumeWriteback = false
-            outputVolumeAvailable = true
+    private func defaultOutputChanged() {
+        guard isOn, SystemAudio.defaultOutputDevice() != SystemAudio.macStereoFixDeviceID() else { return }
+        turnOff()
+        statusMessage = "Force Stereo stopped because the output changed in macOS."
+    }
+
+    private func recoverOutput() {
+        if SystemAudio.restoreOutput(preferredUID: previousOutputUID ?? selectedOutputUID) {
+            recovery.disarm()
+            defaults.removeObject(forKey: "recoveryOutputUID")
         } else {
-            outputVolumeAvailable = false
+            lastError = "Could not restore sound. Open System Settings → Sound → Output and choose your speakers or headphones."
         }
     }
-
-    private func installDeviceListListener() {
-        var addr = AudioObjectPropertyAddress(
-            mSelector: kAudioHardwarePropertyDevices,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain
-        )
-        let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
-            DispatchQueue.main.async {
-                self?.refreshDevices()
-            }
-        }
-        AudioObjectAddPropertyListenerBlock(
-            AudioObjectID(kAudioObjectSystemObject),
-            &addr,
-            DispatchQueue.main,
-            block)
-    }
-
-    // MARK: - Toggle / routing
 
     func toggle() {
-        if isOn {
-            turnOff()
-        } else {
-            turnOn()
-        }
+        guard !isBusy else { return }
+        if isOn { turnOff() } else { turnOn() }
     }
 
     func turnOn() {
-        guard !isOn else { return }
+        guard !isOn, !isBusy else { return }
         lastError = nil
-        guard let outputUID = selectedOutputUID,
-              let target = availableOutputs.first(where: { $0.uid == outputUID }) else {
-            lastError = "No output device selected."
+        statusMessage = nil
+        isBusy = true
+        generation += 1
+        let request = generation
+        let requestedOutput = selectedOutputUID
+        Task { [weak self] in
+            guard let self else { return }
+            let allowed = await self.requestPermission()
+            guard self.generation == request else { return }
+            guard allowed else {
+                self.isBusy = false
+                self.lastError = "Allow MacStereoFix in System Settings → Privacy & Security → Microphone, then try again. It reads the virtual audio device, not your physical microphone."
+                return
+            }
+            guard self.selectedOutputUID == requestedOutput else {
+                self.isBusy = false
+                self.lastError = "The selected output changed while waiting for permission. Select your output and try again."
+                return
+            }
+            await self.startRouting(request: request)
+        }
+    }
+
+    private func startRouting(request: Int) async {
+        defer { if generation == request { isBusy = false } }
+        guard let uid = selectedOutputUID,
+              let target = availableOutputs.first(where: { $0.uid == uid }),
+              DriverManager.isInstalled(), let virtual = SystemAudio.macStereoFixDeviceID() else {
+            lastError = "Install the current driver and select an available stereo output first."
             return
         }
-        guard DriverManager.isInstalled() else {
-            lastError = "MacStereoFix driver not installed."
-            return
-        }
-        guard let macStereoFix = SystemAudio.macStereoFixDeviceID() else {
-            lastError = "MacStereoFix device missing — try Reinstall Driver."
-            return
-        }
+        let current = SystemAudio.defaultOutputDevice()
+        previousOutputUID = current == virtual ? target.uid : SystemAudio.deviceUID(current) ?? target.uid
+        defaults.set(previousOutputUID, forKey: "recoveryOutputUID")
         do {
+            try recovery.arm(preferredUID: previousOutputUID)
             try router.start(outputDevice: target.id)
+            // Confirm both callbacks run before moving any app's sound to the driver.
+            for _ in 0..<100 {
+                guard generation == request else { return }
+                let progress = router.progress
+                if progress.capture > 0 && progress.render > 0 { break }
+                if router.audioFailed { break }
+                try await Task.sleep(nanoseconds: 20_000_000)
+            }
+            guard generation == request else { return }
+            let progress = router.progress
+            guard !router.audioFailed, progress.capture > 0, progress.render > 0, recovery.isRunning else {
+                throw RoutingError.message("Audio could not start. Your normal output was kept. Check audio permission and reconnect your output device.")
+            }
+            guard selectedOutputUID == uid, SystemAudio.allOutputDevices().contains(target),
+                  DriverManager.isInstalled(), SystemAudio.sampleRate(target.id) == router.outputSampleRate else {
+                throw RoutingError.message("The selected audio device changed while starting. Select your output and try again.")
+            }
+            guard SystemAudio.defaultOutputDevice() == current else {
+                throw RoutingError.message("The macOS output changed while starting. Try again with the output you want.")
+            }
+            setupVirtualVolume(virtual)
+            guard SystemAudio.setDefaultOutputDevice(virtual), SystemAudio.defaultOutputDevice() == virtual else {
+                throw RoutingError.message("Could not select MacStereoFix as the output.")
+            }
+            routedDeviceID = target.id
+            lastProgress = router.progress
+            stalledChecks = 0
+            isOn = true
         } catch {
-            lastError = error.localizedDescription
-            return
+            stopWithError(error.localizedDescription)
         }
-        // Wire the virtual device's volume control to the real output so
-        // the hardware volume keys adjust the real device while running.
-        // Must happen BEFORE hijacking the default so the first key press
-        // (which usually happens after the default change) finds us ready.
-        setupVirtualVolumeBridge(macStereoFix: macStereoFix, realDeviceID: target.id)
-
-        // Hijack the system default output to MacStereoFix so games go through us.
-        previousDefaultDevice = SystemAudio.defaultOutputDevice()
-        if previousDefaultDevice == macStereoFix {
-            // Avoid restoring back to ourselves on Off; pick the user's chosen
-            // real device as the "previous" so toggling Off restores cleanly.
-            previousDefaultDevice = target.id
-        }
-        if !SystemAudio.setDefaultOutputDevice(macStereoFix) {
-            tearDownVirtualVolumeBridge()
-            router.stop()
-            lastError = "Could not set MacStereoFix as default output device."
-            return
-        }
-        isOn = true
-        UserDefaults.standard.set(true, forKey: "wasOn")
     }
 
-    func turnOff() {
-        if previousDefaultDevice != 0 {
-            SystemAudio.setDefaultOutputDevice(previousDefaultDevice)
-        }
-        tearDownVirtualVolumeBridge()
+    private func stopWithError(_ message: String) {
+        let restored = turnOff()
+        lastError = restored ? message : message + " Choose your speakers or headphones in System Settings → Sound → Output to restore sound."
+    }
+
+    @discardableResult
+    func turnOff() -> Bool {
+        generation += 1
+        // Restore before stopping capture/render; preserve a user's manual output change.
+        let restored = SystemAudio.restoreOutput(preferredUID: previousOutputUID ?? selectedOutputUID)
+        volumeObservation = nil
+        muteObservation = nil
+        virtualVolumeControlID = nil
+        virtualMuteControlID = nil
         router.stop()
+        routedDeviceID = nil
         isOn = false
-        UserDefaults.standard.set(false, forKey: "wasOn")
+        isBusy = driverChangeInProgress
+        if restored {
+            recovery.disarm()
+            defaults.removeObject(forKey: "recoveryOutputUID")
+        } else {
+            lastError = "Could not restore sound. Choose your speakers or headphones in System Settings → Sound → Output."
+        }
+        return restored
     }
 
-    /// Switch the real output device while the pipeline stays active.
-    /// The system default (MacStereoFix) is untouched — only the render side
-    /// is rebuilt, so there's no audible gap or device-switch glitch.
-    func switchOutputDeviceLive(to uid: String) {
-        guard isOn else { return }
-        guard let target = availableOutputs.first(where: { $0.uid == uid }) else {
-            lastError = "Device not found."
-            return
-        }
-        do {
-            try router.switchOutputDevice(target.id)
-            // Update previousDefaultDevice so Off restores to the new choice.
-            previousDefaultDevice = target.id
-            // Re-seed the virtual control from the new real device so the
-            // next volume key press steps from the right baseline.
-            reseedVirtualVolumeBridge(realDeviceID: target.id)
-        } catch {
-            lastError = error.localizedDescription
-        }
+    func selectOutput(_ uid: String) {
+        guard !isBusy else { return }
+        let resume = isOn
+        if resume && !turnOff() { return }
+        selectedOutputUID = uid.isEmpty ? nil : uid
+        if resume { turnOn() }
     }
 
-    // MARK: - Driver install / uninstall
-
-    func installDriver() {
-        lastError = nil
-        if let err = DriverManager.installDriver() {
-            lastError = err
-        }
-        // Give coreaudiod a moment to come back, then re-scan.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
-            self?.refreshDevices()
-        }
-    }
-
-    func uninstallDriver() {
-        if isOn { turnOff() }
-        lastError = nil
-        if let err = DriverManager.uninstallDriver() {
-            lastError = err
-        }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
-            self?.refreshDevices()
-        }
-    }
-
-    // MARK: - Virtual volume bridge
-
-    /// Discover MacStereoFix's output volume control, seed it with the
-    /// real device's current volume, and install a listener so hardware
-    /// volume-key presses mirror onto the real device. Called by turnOn.
-    private func setupVirtualVolumeBridge(macStereoFix: AudioDeviceID, realDeviceID: AudioDeviceID) {
-        guard let ctl = SystemAudio.outputVolumeControlID(for: macStereoFix) else {
-            // Driver predates the volume control — slider still works,
-            // hardware volume keys just won't. Not an error.
-            virtualVolumeControlID = nil
-            virtualVolumeListenerBlock = nil
-            return
-        }
-        virtualVolumeControlID = ctl
-
-        // Seed the control with the real device's current volume so the
-        // first key press produces a normal-sized step rather than a jump
-        // from whatever stale value the driver last remembered.
-        if let realVol = SystemAudio.deviceVolume(realDeviceID) {
-            SystemAudio.setControlScalarValue(ctl, realVol)
-        }
-
-        // Install the listener. AudioObjectAddPropertyListenerBlock will
-        // deliver the callback on the queue we pass, so we're already on
-        // main when the handler runs.
-        let block = SystemAudio.installControlScalarListener(
-            on: ctl,
-            queue: .main
-        ) { [weak self] in
-            MainActor.assumeIsolated {
-                self?.handleVirtualVolumeChange()
+    private func setupVirtualVolume(_ virtual: AudioDeviceID) {
+        if let muteControl = SystemAudio.outputControlID(for: virtual, class: kAudioMuteControlClassID) {
+            virtualMuteControlID = muteControl
+            SystemAudio.setControlMuted(muteControl, isMuted)
+            muteObservation = AudioObservation(object: muteControl, selector: kAudioBooleanControlPropertyValue) { [weak self] in
+                guard let self, let value = SystemAudio.controlMuted(muteControl) else { return }
+                self.updatingVolume = true
+                self.isMuted = value
+                self.updatingVolume = false
             }
         }
-        virtualVolumeListenerBlock = block
-    }
-
-    /// Remove the listener and clear cached state. Called by turnOff.
-    private func tearDownVirtualVolumeBridge() {
-        if let ctl = virtualVolumeControlID, let block = virtualVolumeListenerBlock {
-            SystemAudio.removeControlScalarListener(on: ctl, queue: .main, block: block)
+        guard let control = SystemAudio.outputControlID(for: virtual, class: kAudioVolumeControlClassID) else { return }
+        virtualVolumeControlID = control
+        SystemAudio.setControlScalarValue(control, outputVolume)
+        volumeObservation = AudioObservation(object: control, selector: kAudioLevelControlPropertyScalarValue) { [weak self] in
+            guard let self, let value = SystemAudio.controlScalarValue(control) else { return }
+            self.updatingVolume = true
+            self.outputVolume = value
+            self.updatingVolume = false
         }
-        virtualVolumeControlID = nil
-        virtualVolumeListenerBlock = nil
     }
 
-    /// When the real output device changes mid-session, re-read its
-    /// current volume and push it into the virtual control so the next
-    /// key press steps from the right baseline.
-    private func reseedVirtualVolumeBridge(realDeviceID: AudioDeviceID) {
-        guard let ctl = virtualVolumeControlID else { return }
-        guard let realVol = SystemAudio.deviceVolume(realDeviceID) else { return }
-        SystemAudio.setControlScalarValue(ctl, realVol)
-    }
-
-    /// Fired when macOS writes a new value to the virtual device's output
-    /// volume control — usually because the user pressed a hardware volume
-    /// key. Mirror the new value to the real device and update the slider.
-    private func handleVirtualVolumeChange() {
-        guard let ctl = virtualVolumeControlID else { return }
-        guard let newValue = SystemAudio.controlScalarValue(ctl) else { return }
-        if let uid = selectedOutputUID,
-           let dev = availableOutputs.first(where: { $0.uid == uid }) {
-            SystemAudio.setDeviceVolume(dev.id, newValue)
+    private func checkAudioHealth() {
+        guard isOn else { return }
+        router.updateClockDrift()
+        let progress = router.progress
+        let stalled = progress.capture == lastProgress.capture || progress.render == lastProgress.render
+        stalledChecks = stalled ? stalledChecks + 1 : 0
+        lastProgress = progress
+        let rateChanged = routedDeviceID.map { SystemAudio.sampleRate($0) != router.outputSampleRate } ?? true
+        if router.audioFailed || stalledChecks >= 3 || rateChanged || !recovery.isRunning {
+            stopWithError("Audio routing stopped working, so Force Stereo was turned off. Check your output device and try again.")
         }
-        // Update the slider, suppressing the didSet so it doesn't write
-        // back to the real device or the virtual control again.
-        suppressVolumeWriteback = true
-        outputVolume = newValue
-        suppressVolumeWriteback = false
+    }
+
+    func installDriver() { changeDriver(install: true) }
+    func uninstallDriver() { changeDriver(install: false) }
+
+    private func changeDriver(install: Bool) {
+        guard !isBusy else { return }
+        // Removal must remain possible on a headless Mac with no physical
+        // output. Always stop IO, even when there is nowhere to restore sound.
+        let restored = turnOff()
+        lastError = nil
+        statusMessage = install ? "Installing driver…" : "Removing driver…"
+        isBusy = true
+        driverChangeInProgress = true
+        Task { [weak self] in
+            let error = await Task.detached {
+                install ? DriverManager.installDriver() : DriverManager.uninstallDriver()
+            }.value
+            guard let self else { return }
+            if let error {
+                self.statusMessage = nil
+                self.lastError = error
+            } else {
+                self.statusMessage = install ? "Driver copied. Waiting for macOS audio…" : "Driver removed."
+            }
+            // Registration can take longer than a fixed 1.5-second delay.
+            self.refreshDevices()
+            if error == nil {
+                for _ in 0..<20 {
+                    if install == self.driverInstalled { break }
+                    try? await Task.sleep(nanoseconds: 250_000_000)
+                    self.refreshDevices()
+                }
+            }
+            if error == nil && install {
+                self.statusMessage = self.driverInstalled ? "Driver ready." : nil
+                if !self.driverInstalled { self.lastError = "Driver copied, but macOS hasn't loaded it. Restart your Mac, then try again." }
+            }
+            self.driverChangeInProgress = false
+            self.isBusy = false
+            if !restored && error == nil { self.recoverOutput() }
+        }
+    }
+
+    private enum RoutingError: LocalizedError {
+        case message(String)
+        var errorDescription: String? { switch self { case .message(let text): return text } }
+    }
+
+    nonisolated static func requestAudioPermission() async -> Bool {
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .authorized: return true
+        case .notDetermined: return await AVCaptureDevice.requestAccess(for: .audio)
+        default: return false
+        }
     }
 }

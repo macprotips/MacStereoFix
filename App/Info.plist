@@ -17,9 +17,9 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.2</string>
+	<string>1.3.0</string>
 	<key>CFBundleVersion</key>
-	<string>3</string>
+	<string>4</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>13.0</string>
 	<key>LSUIElement</key>
@@ -29,6 +29,6 @@
 	<key>NSHumanReadableCopyright</key>
 	<string>MacStereoFix</string>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>MacStereoFix will not use or access your microphone. macOS requires this prompt because MacStereoFix reads from its own virtual audio device. Nothing is accessed or recorded.</string>
+	<string>MacStereoFix reads audio routed to its virtual device to play it in stereo. It does not select your physical microphone, save recordings, or send audio over the network. macOS classifies virtual-device capture as microphone access.</string>
 </dict>
 </plist>
