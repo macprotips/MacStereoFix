@@ -1,10 +1,9 @@
 # Release checklist
 
-Status for 1.3.0: **not signed off for public release**. Passing automated checks
-is necessary; it does not replace tests through the actual macOS audio system.
-Record the tested commit SHA, app/driver build number, macOS version, Mac model,
-output device and result for each hardware test. Re-test affected cases after a
-code change. Never reuse a checklist from an older binary.
+Version 1.3: hardware testing and notarization pending.
+
+For each release, record the commit, app and driver versions, macOS version,
+Mac model, output device, and test result. Re-run affected tests after code changes.
 
 ## Automated gates
 
@@ -45,9 +44,8 @@ with the physical device at a low volume. The installer needs a local administra
 
 ## Compatibility matrix
 
-Minimum advertised OS remains macOS 13. Do not claim a version/device tested
-unless a physical test was actually performed. If coverage is unavailable,
-restrict the advertised support rather than assuming it works.
+The build targets macOS 13. Record actual hardware results below; successful
+compilation alone does not establish compatibility.
 
 | Mac / OS | Built-in speakers | Wired / USB | Bluetooth stereo | 44.1 kHz | 48 kHz | 96/192 kHz |
 |---|---|---|---|---|---|---|
@@ -69,8 +67,6 @@ outputs are intentionally outside the supported routing path.
 - [ ] Check the SHA-256 checksum against the published file.
 - [ ] Publish accurate release notes and the matching source; no security-bypass instructions.
 
-The release script deliberately refuses to package an ad-hoc, unnotarized, dirty,
-or unacknowledged source revision as a release. A signing certificate alone does
-not meet these gates. Apple's notarization is an automated malicious-content and
-signing check, not App Review or a guarantee of bug-free behavior.
+The release script checks the tested revision, clean checkout, signatures,
+notarization, and final archive. Notarization does not replace the hardware tests.
 [Apple's notarization documentation](https://developer.apple.com/documentation/security/notarizing-macos-software-before-distribution)

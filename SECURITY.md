@@ -1,18 +1,19 @@
-# Security reports
+# Security
 
-MacStereoFix installs a user-space CoreAudio plug-in and processes system audio.
-A driver defect can interrupt audio beyond this app, so report memory safety,
-privileged installation, signing, or unexpected capture problems as security issues.
+Please report security issues through
+[GitHub's private reporting form](https://github.com/macprotips/MacStereoFix/security/advisories/new).
+Include the app version, macOS version, and steps to reproduce the problem.
+Do not include private recordings, passwords, or signing credentials.
 
-Use **Security → Report a vulnerability** to
-[send a private report](https://github.com/macprotips/MacStereoFix/security/advisories/new).
-Private reporting is enabled. Include the app/driver version, macOS version,
-steps to reproduce, and whether normal output can be restored. Do not attach
-private recordings, passwords, signing keys or notarization credentials.
+Memory errors in the audio driver, unsafe installation behavior, and unexpected
+audio capture are security issues. For other audio problems, use
+[GitHub Issues](https://github.com/macprotips/MacStereoFix/issues).
 
-For ordinary audio compatibility bugs, use GitHub Issues. If sound is stuck,
-select your speakers or headphones in System Settings → Sound → Output.
+If sound stops, choose your speakers or headphones in
+**System Settings → Sound → Output**.
 
-The 1.3.0 audit candidate has automated safety checks but is not yet a public
-release. Older published binaries do not receive fixes until a new release is
-built, verified and published. No release is a guarantee against all vulnerabilities.
+## Versions
+
+Version 1.3 is in development and includes driver, installation, and recovery
+fixes that are not in the published v1.2 app. There is no automatic updater;
+users must download a new release to receive fixes.

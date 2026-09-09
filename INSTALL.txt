@@ -1,0 +1,35 @@
+MacStereoFix
+
+1. Unzip and move MacStereoFix.app to Applications.
+2. Open it and click the speaker icon in the menu bar.
+3. Finish calls and recordings, then click Install Audio Driver… and approve
+   the administrator prompt. All Mac audio briefly stops while the driver loads.
+4. Choose your speakers or headphones and turn Force Stereo on.
+5. Allow microphone access when macOS asks. This reads the virtual audio device,
+   not your physical microphone. The app does not record or upload audio.
+
+Start at a low listening volume. Volume and Mute affect routed audio. Turning
+Force Stereo off returns to your device's normal volume. Dialogue is part of
+normal stereo mixing; optional Dialogue boost is under Advanced and defaults
+to Off.
+
+The app starts off each time you open it. Sleep, a disconnected output, or a
+manual output change stops routing. Choose your output and turn it on again.
+
+If sound stops:
+Choose your speakers or headphones in System Settings > Sound > Output. Do not
+select MacStereoFix manually while the app is off.
+
+If microphone permission was denied:
+Allow MacStereoFix in System Settings > Privacy & Security > Microphone.
+
+If an updated driver has not loaded:
+Restart the Mac.
+
+To uninstall:
+Choose Advanced > Uninstall…, then move the app to the Trash. Removing the driver
+requires administrator approval and briefly interrupts all Mac audio.
+
+Download releases from https://github.com/macprotips/MacStereoFix/releases.
+If macOS cannot verify the app, download a signed, notarized release. Keep
+Gatekeeper and other macOS security settings enabled.

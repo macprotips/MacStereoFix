@@ -1,15 +1,8 @@
 #!/usr/bin/env bash
 #
-# build.sh — builds MacStereoFix.driver and MacStereoFix.app from source.
-#
-# Output goes into ./build/. After running this you can:
-#   sudo ./install.sh         # copy driver into /Library/Audio/Plug-Ins/HAL
-# and then drag build/MacStereoFix.app into /Applications.
-#
-# To produce a signed build for distribution to friends, set:
-#   SIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)"
-# in your environment before running. Without that, the build is ad-hoc signed
-# (works on your own Mac but friends will see Gatekeeper warnings).
+# Build the universal app and audio driver into build/.
+# Set SIGN_IDENTITY to a Developer ID Application identity for a signed build.
+# Without it, the build is ad-hoc signed for local development.
 
 set -euo pipefail
 

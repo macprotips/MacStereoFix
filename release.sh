@@ -34,7 +34,7 @@ xcrun stapler validate "$APP"
 STAGE="$ROOT_DIR/build/release"
 mkdir -p "$STAGE"
 /usr/bin/ditto "$APP" "$STAGE/MacStereoFix.app"
-cp "$ROOT_DIR/FRIENDS_README.txt" "$STAGE/MacStereoFix-INSTRUCTIONS.txt"
+cp "$ROOT_DIR/INSTALL.txt" "$STAGE/MacStereoFix-INSTRUCTIONS.txt"
 cp -R "$ROOT_DIR/ThirdParty" "$STAGE/ThirdParty"
 cp "$ROOT_DIR/PRIVACY.md" "$STAGE/PRIVACY.md"
 {
